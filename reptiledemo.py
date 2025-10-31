@@ -539,40 +539,37 @@ class Reptile:
 # 测试类，继承CnnQnet
 class TestAgent(DRQNAgent):
     def __init__(self, state_shape, num_actions, state_dict_file_path, finetune_lr, finetune_buffer_capacity, seq_len, num_agents_to_test):
-        # 1. 为这个特定的测试智能体创建一个新的回放池
-        finetune_buffer = ReplayBuffer(finetune_buffer_capacity, seq_len, num_agents_to_test, state_shape, device)
         
-        # 2. 调用父类(DRQNAgent)的 __init__ 方法
-        # 这会设置好 q_net, target_q_net, optimizer (使用 finetune_lr), 和 replay_buffer
+        # [新增] 确保测试 device 也被设置
+        test_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        finetune_buffer = ReplayBuffer(finetune_buffer_capacity, seq_len, num_agents_to_test, state_shape, test_device)
+        
         super().__init__(
             num_agents=num_agents_to_test,
             state_shape=state_shape,
             num_actions=num_actions,
             replay_buffer=finetune_buffer,
-            lr=finetune_lr # 微调时可以使用一个不同的(通常更小的)学习率
+            lr=finetune_lr
         )
         
         # 3. 加载元学习到的权重
         try:
-            # [修改] 加载检查点
-            checkpoint = torch.load(state_dict_file_path, map_location=device)
+            checkpoint = torch.load(state_dict_file_path, map_location=self.device) # 使用 super() 中设置的 device
             
-            # [修改] 检查格式并提取权重
             load_state_dict = None
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 load_state_dict = checkpoint['model_state_dict']
             else:
-                load_state_dict = checkpoint # 兼容旧格式
+                load_state_dict = checkpoint
 
-            load_state_dict = torch.load(state_dict_file_path, map_location=device)
-            # 4. 关键：将权重加载到主网络和目标网络
             self.q_net.load_state_dict(load_state_dict)
             self.target_q_net.load_state_dict(load_state_dict)
             print(f"成功加载元学习权重 from '{state_dict_file_path}'")
         except Exception as e:
             print(f"加载模型权重 '{state_dict_file_path}' 失败: {e}")
 
-    # 这个方法用于在特定任务上进行微调
+    # ... fine_tune_on_task (保持不变) ...
     def fine_tune_on_task(self, task_env, num_episodes=20, num_steps_per_train=32):
         print(f"开始在新任务上微调 {num_episodes} 个回合...")
         self.epsilon = 0.5 # 微调初始 epsilon
@@ -592,7 +589,7 @@ class TestAgent(DRQNAgent):
 
             while not (all(terminated) or all(truncated)):
                 obs_np = np.array(obs)
-                states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=device)
+                states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
                 actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
 
@@ -614,10 +611,8 @@ class TestAgent(DRQNAgent):
             })
             print(f"  微调回合 {ep+1}/{num_episodes} 完成 (长度: {ep_len}, 奖励: {ep_reward:.2f})。Buffer: {len(self.replay_buffer)}")
 
-            # --- 训练 ---
-            # 修正：将训练循环放在回合结束后
             if len(self.replay_buffer) >= self.batch_size:
-                for _ in range(num_steps_per_train): # 每个回合后训练 N 步
+                for _ in range(num_steps_per_train): 
                     loss = self.train()
                     if loss is not None:
                          all_finetune_losses.append(loss)
@@ -626,8 +621,7 @@ class TestAgent(DRQNAgent):
         avg_finetune_loss = np.mean(all_finetune_losses) if all_finetune_losses else 0
         print(f"微调完成。共训练 {total_steps_trained} 步。平均损失: {avg_finetune_loss:.4f}")
 
-
-    # 这个方法用于纯粹的评估 (无训练, 无探索)
+    # ... evaluate (保持不变) ...
     def evaluate(self, task_env, render_animation=False, animation_filename="task_evaluation.svg"):
         print(f"开始评估 (零探索)...")
         
@@ -643,16 +637,14 @@ class TestAgent(DRQNAgent):
         current_hidden_state = None
         step_count = 0
 
-        # 评估时关闭探索
         original_epsilon = self.epsilon
         self.epsilon = 0.0 
-        self.q_net.eval() # 切换到评估模式
+        self.q_net.eval() 
 
         with torch.no_grad():
             while not (all(terminated) or all(truncated)):
-                states_tensor = torch.tensor(np.array(states), dtype=torch.float32, device=device)
+                states_tensor = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
                 
-                # 调用 select_actions, epsilon=0 会使其贪婪
                 actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
                 next_states, rewards, terminated, truncated, info = env.step(actions_np)
@@ -660,8 +652,8 @@ class TestAgent(DRQNAgent):
                 states = next_states
                 step_count += 1
         
-        self.q_net.train() # 切换回训练模式
-        self.epsilon = original_epsilon # 恢复 epsilon
+        self.q_net.train() 
+        self.epsilon = original_epsilon 
         
         print(f"评估完成! 总步数: {step_count}, 总奖励: {total_rewards}")
 
@@ -673,15 +665,15 @@ class TestAgent(DRQNAgent):
                 print(f"保存动画时出错: {e}")
         
         return total_rewards, step_count
-        
-        
+    
+    # ... task_env (保持不变) ...
     def task_env(self, task_config):
         config = pogema.GridConfig(
             num_agents=task_config["num_agents"],
             width=task_config["width"],
             height=task_config["height"],
             density=task_config["density"],
-            seed=1024,
+            seed=1031,
             max_episode_steps=task_config["width"] * task_config["height"],
             obs_radius=task_config["obs_radius"],
             on_target='finish',
