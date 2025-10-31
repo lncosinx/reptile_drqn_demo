@@ -486,11 +486,11 @@ class Reptile:
         self.parallel_batch_size = parallel_batch_size # B: 每次并行运行多少个任务
         self.total_meta_iterations = total_meta_iterations # 目标总任务数
         self.meta_batches = self.total_meta_iterations // self.parallel_batch_size # 主循环次数
-        self.meta_lr = 0.001       # 外循环学习率
+        self.meta_lr = 0.0001      # 外循环学习率，降低外部学习率 0.001->0.0001
 
         # --- [修改] 内循环超参数 (将打包发送给 worker) ---
         self.inner_lr = 0.0001     # 内循环学习率 (DRQNAgent 的 lr)
-        self.inner_steps = 32      # k: 内循环中的 *梯度下降步数*
+        self.inner_steps = 512   # k: 内循环中的 *梯度下降步数* ，32->512
         self.episodes_per_task = 10 # 每个任务收集多少个 episode 来填充 buffer
         
         # --- [修改] 回放池参数 (将打包发送给 worker) ---

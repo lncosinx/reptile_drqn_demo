@@ -14,7 +14,7 @@ task_sets_config = {
     "T2":   {"num_targets": 4, "num_agents": 1, "density": 0.15, "width": 16, "height": 16, "obs_radius": 5},
     "T3":   {"num_targets": 6, "num_agents": 1, "density": 0.2, "width": 20, "height": 20, "obs_radius": 5},
     "T4":   {"num_targets": 8, "num_agents": 1, "density": 0.25, "width": 24, "height": 24, "obs_radius": 5},
-    "T5":   {"num_targets": 4, "num_agents": 1, "density": 0.05, "width": 11, "height": 11, "obs_radius": 5},
+    "T5":   {"num_targets": 4, "num_agents": 1, "density": 0.3, "width": 16, "height": 16, "obs_radius": 5},
 }
 
 test_agent = mpreptile.TestAgent(
