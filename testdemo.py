@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
 import time
-import mpreptile
+import mpreptile_optimized
 
 num_tasks_per_set = 20000
 
@@ -17,7 +17,7 @@ task_sets_config = {
     "T5":   {"num_targets": 4, "num_agents": 1, "density": 0.3, "width": 16, "height": 16, "obs_radius": 5},
 }
 
-test_agent = mpreptile.TestAgent(
+test_agent = mpreptile_optimized.TestAgent(
         state_shape=(3, 11, 11),
         num_actions=5,
         state_dict_file_path='reptile_drqn_meta_agent_interrupt.pth',
@@ -26,6 +26,9 @@ test_agent = mpreptile.TestAgent(
         seq_len=8,
         num_agents_to_test=1
     )
+# 重新设置batch size防止len(self.replay_buffer) >= self.batch_size永远为False
+# 因为这里的self.batch_size在DRQNAgent中被设置为256，导致这个条件不会被触发
+test_agent.batch_size = 4     
 env = test_agent.task_env(task_sets_config['T1'])
 test_agent.evaluate(env, render_animation=True, animation_filename="not_fine_tune.svg")
 test_agent.fine_tune_on_task(env, num_episodes=20, num_steps_per_train=32)                # 微调

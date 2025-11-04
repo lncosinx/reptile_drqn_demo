@@ -696,7 +696,8 @@ class Reptile:
                           f"Meta Epsilon: {self.meta_agent.epsilon:.4f} | "
                           f"Total Train Steps: {meta_agent_total_steps} | "
                           f"Time/Batch: {batch_time:.2f}s | "
-                          f"Avg Time/Batch: {avg_time_per_batch:.2f}s")
+                          f"Avg Time/Batch: {avg_time_per_batch:.2f}s | "
+                          f"Timestamp: {time.strftime('%Y%m%d %X')}")
                     # 重置总计时器，以便 Avg Time/Batch 更准确
                     start_time = time.time()
                     start_batch = meta_batch + 1

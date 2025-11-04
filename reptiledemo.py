@@ -489,7 +489,8 @@ class Reptile:
                         # 修正：打印 meta_agent 的 epsilon
                         f"Meta Epsilon: {self.meta_agent.epsilon:.4f} | "
                         f"Total Train Steps: {meta_agent_total_steps} | " # 打印总训练步数
-                        f"Time/Iter: {elapsed / self.print_freq:.2f}s")
+                        f"Time/Iter: {elapsed / self.print_freq:.2f}s | "
+                        f"Timestamp: {time.strftime('%Y%m%d %X')}")
                     start_time = time.time() # 重置计时器
 
                 if (meta_iter + 1) % self.save_freq == 0:
