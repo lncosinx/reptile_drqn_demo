@@ -385,8 +385,9 @@ class DRQNAgent:
     def __init__(self, num_agents, state_shape, num_actions, replay_buffer, lr):
         # [修改] device 在这里定义，从主进程或 worker 传入
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.use_scaler = torch.cuda.is_available()
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler) #较旧的cuda版本请使用下一行代码并注释这一行
+        #self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)    
         self.num_agents = num_agents
         self.state_shape = state_shape
         self.num_actions = num_actions
@@ -874,7 +875,8 @@ class TestAgent(DRQNAgent):
                 total_rewards += np.array(rewards)
                 states = next_states
                 step_count += 1
-        
+                #print(actions_np) #调试
+
         self.q_net.train() 
         self.epsilon = original_epsilon 
         
@@ -896,7 +898,7 @@ class TestAgent(DRQNAgent):
             width=task_config["width"],
             height=task_config["height"],
             density=task_config["density"],
-            seed=1024,
+            seed=random.randrange(1,100000),
             max_episode_steps=task_config["width"] * task_config["height"],
             obs_radius=task_config["obs_radius"],
             on_target='finish',
