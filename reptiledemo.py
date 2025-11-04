@@ -275,7 +275,7 @@ class DRQNAgent:
             #贝尔曼方程计算目标 Q 值
             target_q_values = rewards + self.gamma * target_next_q_values * (1 - dones)  # (B*N, T)
         # 计算损失
-        loss = nn.MSELoss()(q_values, target_q_values.detach())
+        loss = nn.MSELoss()(q_values, target_q_values)
 
         # 优化网络
         self.optimizer.zero_grad()
