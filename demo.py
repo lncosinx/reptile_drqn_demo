@@ -22,5 +22,5 @@ while True:
     env.render()
     if (all(terminated) or all (truncated)) or (reward == num_target): 
         break
-
+        
 env.save_animation('demo.svg')

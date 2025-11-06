@@ -3,30 +3,18 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import copy
 import random
 import pogema
 from collections import deque
 import time
 import os
-# [修改] 导入 torch.multiprocessing
 import torch.multiprocessing as mp
+import task_environment
+from mpreptile_optimized import goal_in_obs_reward_multi_agent
 
 # [修改] 不要在全局定义 device。
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 我们将在主进程和 worker 进程中分别定义它。
-
-num_tasks_per_set = 20000 # 每个任务集中的任务数量
-
-# 定义任务集(以每个任务集的参数生成num_tasks_per_set个任务)
-task_sets_config = {
-    "T1":   {"num_targets": 2, "num_agents": 1, "density": 0.1, "width": 12, "height": 12, "obs_radius": 5},
-    "T2":   {"num_targets": 4, "num_agents": 1, "density": 0.15, "width": 16, "height": 16, "obs_radius": 5},
-    "T3":   {"num_targets": 6, "num_agents": 1, "density": 0.2, "width": 20, "height": 20, "obs_radius": 5},
-    "T4":   {"num_targets": 8, "num_agents": 1, "density": 0.25, "width": 24, "height": 24, "obs_radius": 5},
-    "T5":   {"num_targets": 4, "num_agents": 1, "density": 0.3, "width": 16, "height": 16, "obs_radius": 5},
-}
-
 # -------------------------------------------------------------------
 # [新增] 并行工作函数 (必须在全局范围)
 # -------------------------------------------------------------------
@@ -88,7 +76,8 @@ def reptile_worker(args):
             current_hidden_state = None
             terminated = [False] * config['num_agents']
             truncated = [False] * config['num_agents']
-            episode_reward = 0
+            episode_reward_tensor = torch.zeros(config['num_agents'], dtype=torch.float32, device=worker_device)
+            num_get_obs_rewards_list = [0] * config['num_agents']
 
             while not (all(terminated) or all(truncated)):
                 obs_np = np.array(obs)
@@ -108,14 +97,22 @@ def reptile_worker(args):
                 ep_dones.append(terminated)
                 
                 obs = next_obs
-                episode_reward += rewards[0] if rewards else 0
+                goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, worker_device)
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=worker_device)
+                total_step_rewards = rewards_tensor + goal_rewards_tensor
+                episode_reward_tensor += total_step_rewards
+
+                for i in range(config['num_agents']):   
+                    if rewards[i] :
+                        num_get_obs_rewards_list[i] = 0
+
 
             task_agent.replay_buffer.push({
                 'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
                 'next_states': ep_next_states, 'dones': ep_dones
             })
             current_task_episodes += 1
-            current_task_rewards.append(episode_reward)
+            current_task_rewards.append(episode_reward_tensor.cpu().numpy())
 
         # --- 阶段 2: 训练 ---
         inner_losses = []
@@ -124,7 +121,6 @@ def reptile_worker(args):
         if len(task_agent.replay_buffer) > 0:
             for i in range(config['inner_steps']):
                 # 注意：task_agent.train() 会衰减它自己的 epsilon
-                # 我们只关心它训练了多少步
                 loss = task_agent.train() 
                 if loss is not None:
                     inner_losses.append(loss)
@@ -153,82 +149,6 @@ def reptile_worker(args):
         import traceback
         traceback.print_exc()
         return (None, 0, 0, 0)
-
-# 定义任务环境类
-class task_environment:
-    def __init__(self, config, num_tasks, pogema):
-        self.config = config
-        self.pogema = pogema
-        self.num_tasks = num_tasks
-        self.num_targets = config['num_targets']
-        self.num_agents = config['num_agents']
-        self.density = config['density']
-        self.width = config['width']
-        self.height = config['height']
-        self.obs_radius = config['obs_radius']
-    
-    # 方便记录生成的随机种子,以便复现
-    def seed_generator(self):
-        seeds = random.sample(range(1, 100000), self.num_tasks)
-        return seeds
-    
-    # [修改] 并行化任务创建 (方向 1)
-    # 我们也在这里应用并行化，因为 100,000 个任务串行创建会很慢
-    
-    # 辅助函数，必须是可 pickle 的 (顶层或静态)
-    @staticmethod
-    def _create_single_env(config_dict):
-        try:
-            config = pogema.GridConfig(
-                num_agents=config_dict['num_agents'],
-                width=config_dict['width'],
-                height=config_dict['height'],
-                density=config_dict['density'],
-                seed=config_dict['seed'],
-                max_episode_steps=config_dict['width'] * config_dict['height'],
-                obs_radius=config_dict['obs_radius'],
-                on_target='finish',
-            )
-            env = pogema.pogema_v0(grid_config=config)
-            return (config_dict['seed'], env)
-        except Exception as e:
-            print(f"创建环境失败 (Seed: {config_dict.get('seed')}): {e}")
-            return (config_dict.get('seed'), None)
-
-    def sample_task(self):
-        seeds = self.seed_generator()
-        
-        config_params_list = []
-        for seed in seeds:
-            params = self.config.copy()
-            params['seed'] = seed
-            config_params_list.append(params)
-
-        envs = {}
-        
-        print(f"正在为 {self.width}x{self.height} (density {self.density}) 并行创建 {self.num_tasks} 个环境...")
-        start_time = time.time()
-        
-        # [修改] 使用 multiprocessing Pool
-        # 让 Python 自动决定进程数
-        with mp.Pool(processes=os.cpu_count()) as pool:
-            results = pool.map(task_environment._create_single_env, config_params_list)
-        
-        # 过滤掉创建失败的环境
-        envs = {seed: env for seed, env in results if env is not None}
-        
-        elapsed = time.time() - start_time
-        print(f"创建 {len(envs)} 个环境完成，耗时: {elapsed:.2f}s")
-        return envs
-
-    @classmethod
-    def create_task_sets(cls, configs,num_tasks, pogema):
-        task_set_dict = {}
-        for task_name, params in configs.items():
-            task_env = cls(params, num_tasks, pogema)
-            # sample_task 现在是并行的了
-            task_set_dict[task_name] = task_env.sample_task()
-        return task_set_dict
 
 # 定义DRQN网络
 class CnnQnet(nn.Module):
@@ -470,18 +390,18 @@ class DRQNAgent:
 
 # 定义 Reptile 元学习算法
 class Reptile:
-    def __init__(self, all_task_sets, state_shape, num_actions, num_agents, task_sets, 
+    def __init__(self, state_shape, num_actions, num_agents,  
                  parallel_batch_size, total_meta_iterations, model_path=None):
         
         # [新增] 主进程 device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"[Main] 主进程使用 device: {self.device}")
         
-        self.all_task_sets = all_task_sets
+        # self.all_task_sets = all_task_sets
         self.state_shape = state_shape # (C, H, W)
         self.num_actions = num_actions
         self.num_agents = num_agents
-        self.task_sets = task_sets
+        # self.task_sets = task_sets
 
         # --- [修改] 元学习超参数 ---
         self.parallel_batch_size = parallel_batch_size # B: 每次并行运行多少个任务
@@ -492,10 +412,10 @@ class Reptile:
         # --- [修改] 内循环超参数 (将打包发送给 worker) ---
         self.inner_lr = 0.0001     # 内循环学习率 (DRQNAgent 的 lr)
         self.inner_steps = 512   # k: 内循环中的 *梯度下降步数* ，32->512
-        self.episodes_per_task = 10 # 每个任务收集多少个 episode 来填充 buffer
+        self.episodes_per_task = 300 # 每个任务收集多少个 episode 来填充 buffer
         
         # --- [修改] 回放池参数 (将打包发送给 worker) ---
-        self.replay_buffer_capacity = 1000 # 减小容量，使其特定于任务
+        self.replay_buffer_capacity = self.episodes_per_task # 回放池容量设为每任务 episode 数
         self.seq_len = 24           # 减小序列长度
         self.batch_size = 128        # 减小批次大小
 
@@ -606,16 +526,16 @@ class Reptile:
                 
                 # --- 2. 采样 B 个任务 ---
                 args_list = []
-                tasks_in_batch_names = [] # 用于日志
+                # tasks_in_batch_names = [] # 用于日志
                 for _ in range(self.parallel_batch_size):
-                    task_set_name = random.choice(list(self.task_sets.keys()))
+                    """ task_set_name = random.choice(list(self.task_sets.keys()))
                     task_set = self.all_task_sets[task_set_name]
                     if not task_set:
                         print(f"警告：任务集 {task_set_name} 为空，跳过一个任务。")
-                        continue
-                    task_env = random.choice(list(task_set.values()))
+                        continue """
+                    task_env = task_environment.create_task_env()
                     
-                    tasks_in_batch_names.append(task_set_name)
+                    # tasks_in_batch_names.append(task_set_name)
                     args_list.append((task_env, meta_weights_cpu, current_meta_epsilon, self.worker_config))
 
                 if not args_list:
@@ -759,159 +679,6 @@ class Reptile:
             plt.savefig('reptile_batch_reward_curve.png')
             print("批次奖励曲线图已保存为 reptile_batch_reward_curve.png")
 
-
-# --- 测试类 (基本保持不变) ---
-# [修改] 需要确保它在初始化时也设置了 self.device
-class TestAgent(DRQNAgent):
-    def __init__(self, state_shape, num_actions, state_dict_file_path, finetune_lr, finetune_buffer_capacity, seq_len, num_agents_to_test):
-        
-        # [新增] 确保测试 device 也被设置
-        test_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        finetune_buffer = ReplayBuffer(finetune_buffer_capacity, seq_len, num_agents_to_test, state_shape, test_device)
-        
-        super().__init__(
-            num_agents=num_agents_to_test,
-            state_shape=state_shape,
-            num_actions=num_actions,
-            replay_buffer=finetune_buffer,
-            lr=finetune_lr
-        )
-        
-        # 3. 加载元学习到的权重
-        try:
-            checkpoint = torch.load(state_dict_file_path, map_location=self.device) # 使用 super() 中设置的 device
-            
-            load_state_dict = None
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                load_state_dict = checkpoint['model_state_dict']
-            else:
-                load_state_dict = checkpoint
-
-            self.q_net.load_state_dict(load_state_dict)
-            self.target_q_net.load_state_dict(load_state_dict)
-            print(f"成功加载元学习权重 from '{state_dict_file_path}'")
-        except Exception as e:
-            print(f"加载模型权重 '{state_dict_file_path}' 失败: {e}")
-
-    # ... fine_tune_on_task (保持不变) ...
-    def fine_tune_on_task(self, task_env, num_episodes=20, num_steps_per_train=32):
-        print(f"开始在新任务上微调 {num_episodes} 个回合...")
-        self.epsilon = 0.5 # 微调初始 epsilon
-        self.epsilon_min = 0.1
-        self.epsilon_decay = 0.99
-        total_steps_trained = 0
-        all_finetune_losses = []
-
-        for ep in range(num_episodes):
-            ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = [], [], [], [], []
-            obs, info = task_env.reset()
-            current_hidden_state = None
-            terminated = [False] * self.num_agents
-            truncated = [False] * self.num_agents
-            ep_len = 0
-            ep_reward = 0
-
-            while not (all(terminated) or all(truncated)):
-                obs_np = np.array(obs)
-                states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
-                actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
-                current_hidden_state = new_hidden_state
-
-                next_obs, rewards, terminated, truncated, info = task_env.step(actions_np)
-                next_obs_np = np.array(next_obs)
-
-                ep_states.append(obs_np)
-                ep_actions.append(actions_np)
-                ep_rewards.append(rewards)
-                ep_next_states.append(next_obs_np)
-                ep_dones.append(terminated)
-                obs = next_obs
-                ep_len += 1
-                ep_reward += rewards[0] if rewards else 0
-
-            self.replay_buffer.push({
-                'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
-                'next_states': ep_next_states, 'dones': ep_dones
-            })
-            print(f"  微调回合 {ep+1}/{num_episodes} 完成 (长度: {ep_len}, 奖励: {ep_reward:.2f})。Buffer: {len(self.replay_buffer)}")
-
-            if len(self.replay_buffer) >= self.batch_size:
-                for _ in range(num_steps_per_train): 
-                    loss = self.train()
-                    if loss is not None:
-                         all_finetune_losses.append(loss)
-                         total_steps_trained += 1
-
-        avg_finetune_loss = np.mean(all_finetune_losses) if all_finetune_losses else 0
-        print(f"微调完成。共训练 {total_steps_trained} 步。平均损失: {avg_finetune_loss:.4f}")
-
-    # ... evaluate (保持不变) ...
-    def evaluate(self, task_env, render_animation=False, animation_filename="task_evaluation.svg"):
-        print(f"开始评估 (零探索)...")
-        
-        if render_animation:
-            env = pogema.AnimationMonitor(task_env)
-        else:
-            env = task_env
-
-        states, info = env.reset()
-        terminated = [False] * self.num_agents
-        truncated = [False] * self.num_agents
-        total_rewards = np.zeros(self.num_agents)
-        current_hidden_state = None
-        step_count = 0
-
-        original_epsilon = self.epsilon
-        self.epsilon = 0.0 
-        self.q_net.eval() 
-
-        with torch.no_grad():
-            while not (all(terminated) or all(truncated)):
-                states_tensor = torch.tensor(np.array(states), dtype=torch.float32, device=self.device)
-                
-                actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
-                current_hidden_state = new_hidden_state
-                next_states, rewards, terminated, truncated, info = env.step(actions_np)
-                total_rewards += np.array(rewards)
-                states = next_states
-                step_count += 1
-                #print(actions_np) #调试
-
-        self.q_net.train() 
-        self.epsilon = original_epsilon 
-        
-        print(f"评估完成! 总步数: {step_count}, 总奖励: {total_rewards}")
-
-        if render_animation:
-            try:
-                env.save_animation(animation_filename)
-                print(f"动画已保存至 {animation_filename}\n")
-            except Exception as e:
-                print(f"保存动画时出错: {e}")
-        
-        return total_rewards, step_count
-    
-    # ... task_env (保持不变) ...
-    def task_env(self, task_config):
-        config = pogema.GridConfig(
-            num_agents=task_config["num_agents"],
-            width=task_config["width"],
-            height=task_config["height"],
-            density=task_config["density"],
-            seed=random.randrange(1,100000),
-            max_episode_steps=task_config["width"] * task_config["height"],
-            obs_radius=task_config["obs_radius"],
-            on_target='finish',
-        )
-        env = pogema.pogema_v0(grid_config=config)
-        return env
-    
-"""
-        animation_filename = "task_test.svg"
-        env.pogema.AnimationMonitor.save_animation(animation_filename)
-        print(f"动画已保存至 {animation_filename}\n")
-"""
 if __name__ == '__main__':
     # [关键] 必须设置 'spawn' 才能安全地将 CUDA 与 multiprocessing 一起使用
     # 这必须是 __name__ == '__main__' 块中的第一件事
@@ -925,18 +692,16 @@ if __name__ == '__main__':
     PARALLEL_BATCH_SIZE = 14 # [可调] 并行运行 8 个任务。根据您的 CPU 核心数调整
     TOTAL_META_ITERATIONS = 500000 # [可调] 您的目标总任务数
     
-    print("正在创建任务集 (这可能需要一些时间)...")
+    """ print("正在创建任务集 (这可能需要一些时间)...")
     generated_task = task_environment.create_task_sets(task_sets_config,num_tasks_per_set, pogema)
-    print("任务集创建完毕。")
+    print("任务集创建完毕。") """
 
     model_path = 'reptile_drqn_meta_agent_interrupt.pth'if os.path.exists('reptile_drqn_meta_agent_interrupt.pth') else None
 
     reptile = Reptile(
-        all_task_sets=generated_task,
         state_shape=(3, 11, 11),
         num_actions=5,
         num_agents=1,
-        task_sets=task_sets_config,
         parallel_batch_size=PARALLEL_BATCH_SIZE, # [新增]
         total_meta_iterations=TOTAL_META_ITERATIONS, # [新增]
         model_path= model_path,
