@@ -1,6 +1,5 @@
 #训练配置：RTX4090 24GB(99%使用率，23933MiB占用) 16vCPU(只分配了14个线程，1409%使用率) 120GB内存（占用11.3GB）
 #pytorch: 2.1.2 python: 3.10 cuda:11.8
-#由于cuda版本问题，cuda版本较新时，请注释299行，恢复300行，注释344行，恢复345行
 
 import torch
 import torch.nn as nn
