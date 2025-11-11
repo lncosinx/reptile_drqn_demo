@@ -2,18 +2,17 @@ import mpreptile_optimized
 import task_environment
 import torch
 import numpy as np
-from mpreptile_optimized import DRQNAgent
-from mpreptile_optimized import goal_in_obs_reward_multi_agent
-from mpreptile_optimized import ReplayBuffer
 import pogema
-
+from module_set import  RewardSet, ReplayBuffer, DRQNAgent
 
 class TestAgent(DRQNAgent):
     def __init__(self, state_shape, num_actions, state_dict_file_path, finetune_state_dict_file_path, finetune_lr, finetune_buffer_capacity, seq_len, num_agents_to_test):
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.seq_len = seq_len
         
-        finetune_buffer = ReplayBuffer(finetune_buffer_capacity, seq_len, num_agents_to_test, state_shape, self.device)
+        finetune_buffer = ReplayBuffer(finetune_buffer_capacity, self.seq_len, num_agents_to_test, state_shape, self.device)
         
         self.finetune_state_dict_file_path = finetune_state_dict_file_path
 
@@ -49,51 +48,65 @@ class TestAgent(DRQNAgent):
         total_steps_trained = 0
         all_finetune_losses = []
 
+        # 为填充（padding）准备“空”数据
+        # (N, C, H, W)
+        empty_obs_np = np.zeros((self.num_agents, *self.state_shape), dtype=np.float32) 
+        # (N,)
+        empty_action_np = np.zeros(self.num_agents, dtype=np.int64)
+        # (N,)
+        empty_reward_list = [0.0] * self.num_agents 
+        # (N,)
+        empty_done_list = [True] * self.num_agents
+
         for ep in range(num_episodes):
             ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = [], [], [], [], []
             obs, info = task_env.reset()
             current_hidden_state = None
             terminated = [False] * self.num_agents
             truncated = [False] * self.num_agents
-            ep_len = 0
-            episode_reward_tensor = torch.zeros(self.num_agents, dtype=torch.float32, device=self.device)
-            num_get_obs_rewards_list = [0] * self.num_agents
+            reward_calculator = RewardSet()
 
-            while not (all(terminated) or all(truncated)):
+            while not (all(terminated) or all(truncated)): # 修改终止条件以确保达到目标数量
                 obs_np = np.array(obs)
                 states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
-                actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
+                
+                actions, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
-
-                next_obs, rewards, terminated, truncated, info = task_env.step(actions_np)
+                
+                next_obs, rewards, terminated, truncated, info = task_env.step(actions)
                 next_obs_np = np.array(next_obs)
 
+                rewards_tensor = reward_calculator.calculate_total_reward(rewards, states_tensor, actions) 
+
                 ep_states.append(obs_np)
-                ep_actions.append(actions_np)
-                ep_rewards.append(rewards)
+                ep_actions.append(actions)
+                ep_rewards.append(rewards_tensor.tolist())
                 ep_next_states.append(next_obs_np)
                 ep_dones.append(terminated)
-                ep_len += 1
                 
                 obs = next_obs
-                goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, self.device)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-                total_step_rewards = rewards_tensor + goal_rewards_tensor
-                episode_reward_tensor += total_step_rewards
+                
+            episode_length = len(ep_states)
 
-                for i in range(self.num_agents):   
-                    if rewards[i] :
-                        num_get_obs_rewards_list[i] = 0
-
-            if len(ep_states) >= self.replay_buffer.seq_len:
-                self.replay_buffer.push({
-                    'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
-                    'next_states': ep_next_states, 'dones': ep_dones
-                })
-                print(f"  微调回合 {ep+1}/{num_episodes} 完成 (长度: {ep_len}, 奖励: {episode_reward_tensor.cpu().numpy()})。Buffer: {len(self.replay_buffer)}")
-            else:
-                 print(f"  微调回合 {ep+1}/{num_episodes} 完成 (长度: {ep_len}, 奖励: {episode_reward_tensor.cpu().numpy()})。回合太短，已丢弃。")
-
+            if episode_length < self.seq_len:
+                # 计算需要填充多少步
+                padding_needed = self.seq_len - episode_length
+                
+                # 填充所有列表
+                ep_states.extend([empty_obs_np] * padding_needed)
+                ep_actions.extend([empty_action_np] * padding_needed)
+                ep_rewards.extend([empty_reward_list] * padding_needed)
+                ep_next_states.extend([empty_obs_np] * padding_needed) # 下一个状态也是空的
+                ep_dones.extend([empty_done_list] * padding_needed) # 标记为 "Done"
+            
+            # 现在，所有回合（无论长短）都至少是 seq_len 长
+            # 如果回合长于 seq_len，回放池的采样会自动处理
+            self.replay_buffer.push({
+                'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
+                'next_states': ep_next_states, 'dones': ep_dones
+            })
+            
+            current_task_episodes += 1
 
             if len(self.replay_buffer) >= self.batch_size:
                 for _ in range(num_steps_per_train): 
@@ -138,7 +151,7 @@ class TestAgent(DRQNAgent):
         self.epsilon = 0.0 
         self.q_net.eval() 
         num_get_obs_rewards_list = [0] * self.num_agents
-        episode_reward_tensor = torch.zeros(self.num_agents, dtype=torch.float32, device=self.device)
+        reward_calculator = RewardSet()
 
         with torch.no_grad():
             while not (all(terminated) or all(truncated)):
@@ -147,22 +160,15 @@ class TestAgent(DRQNAgent):
                 actions_np, new_hidden_state = self.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
                 next_states, rewards, terminated, truncated, info = env.step(actions_np)
-                goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, self.device)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-                total_step_rewards = rewards_tensor + goal_rewards_tensor
-                episode_reward_tensor += total_step_rewards
+                rewards_tensor = reward_calculator.calculate_total_reward(rewards, states_tensor, actions_np)
                 states = next_states
                 step_count += 1
-
-                for i in range(self.num_agents):   
-                    if rewards[i] :
-                        num_get_obs_rewards_list[i] = 0
 
 
         self.q_net.train() 
         self.epsilon = original_epsilon 
         
-        print(f"评估完成! 总步数: {step_count}, 总奖励: {episode_reward_tensor.cpu().numpy()}")
+        print(f"评估完成! 总步数: {step_count}, 总奖励: {reward_calculator.total_rewards()}")
 
         if render_animation and isinstance(env, pogema.AnimationMonitor):
             try:
@@ -171,7 +177,7 @@ class TestAgent(DRQNAgent):
             except Exception as e:
                 print(f"保存动画时出错: {e}")
         
-        return episode_reward_tensor.cpu().numpy(), step_count
+        return reward_calculator.total_rewards(), step_count
 
 if __name__ == "__main__":
 
