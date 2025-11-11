@@ -1,22 +1,14 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import random
-import pogema
-from collections import deque
 import time
 import os
 import torch.multiprocessing as mp
 import task_environment
-from mpreptile_optimized import goal_in_obs_reward_multi_agent
+from module_set import RewardSet, ReplayBuffer, DRQNAgent
 
-# [修改] 不要在全局定义 device。
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# 我们将在主进程和 worker 进程中分别定义它。
 # -------------------------------------------------------------------
-# [新增] 并行工作函数 (必须在全局范围)
+# 并行工作函数 (必须在全局范围)
 # -------------------------------------------------------------------
 def reptile_worker(args):
     """
@@ -35,18 +27,23 @@ def reptile_worker(args):
         # 1. [关键] 在工作进程中定义 device
         worker_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        num_agents = config['num_agents']
+        seq_len = config['seq_len']
+        state_shape = config['state_shape']
+
+
         # 2. 重新创建 task_agent
         # (需要 ReplayBuffer, CnnQnet, DRQNAgent 类在全局范围内可用)
         task_buffer = ReplayBuffer(
             config['replay_buffer_capacity'],
-            config['seq_len'],
-            config['num_agents'],
-            config['state_shape'],
+            seq_len,
+            num_agents,
+            state_shape,
             worker_device
         )
         task_agent = DRQNAgent(
-            config['num_agents'],
-            config['state_shape'],
+            num_agents,
+            state_shape,
             config['num_actions'],
             task_buffer,
             config['inner_lr']
@@ -70,49 +67,67 @@ def reptile_worker(args):
         current_task_episodes = 0
         current_task_rewards = []
         
+        # 为填充（padding）准备“空”数据
+        # (N, C, H, W)
+        empty_obs_np = np.zeros((num_agents, *state_shape), dtype=np.float32) 
+         # (N,)
+        empty_action_np = np.zeros(num_agents, dtype=np.int64)
+        # (N,)
+        empty_reward_list = [0.0] * num_agents 
+        # (N,)
+        empty_done_list = [True] * num_agents
+        
         while current_task_episodes < config['episodes_per_task']:
             ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = [], [], [], [], []
             obs, info = task_env.reset()
             current_hidden_state = None
-            terminated = [False] * config['num_agents']
-            truncated = [False] * config['num_agents']
-            episode_reward_tensor = torch.zeros(config['num_agents'], dtype=torch.float32, device=worker_device)
-            num_get_obs_rewards_list = [0] * config['num_agents']
-
-            while not (all(terminated) or all(truncated)):
+            terminated = [False] * num_agents
+            truncated = [False] * num_agents
+            reward_calculator = RewardSet(num_agents, worker_device)
+            
+            while not (all(terminated) or all(truncated)): # 修改终止条件以确保达到目标数量
                 obs_np = np.array(obs)
                 states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=worker_device)
                 
-                # 使用 task_agent 的 epsilon 进行探索
-                actions_np, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
+                actions, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
                 
-                next_obs, rewards, terminated, truncated, info = task_env.step(actions_np)
+                next_obs, rewards, terminated, truncated, info = task_env.step(actions)
                 next_obs_np = np.array(next_obs)
-                
+
+                rewards_tensor = reward_calculator.calculate_total_reward(rewards, states_tensor, actions) 
+
                 ep_states.append(obs_np)
-                ep_actions.append(actions_np)
-                ep_rewards.append(rewards)
+                ep_actions.append(actions)
+                ep_rewards.append(rewards_tensor.tolist())
                 ep_next_states.append(next_obs_np)
                 ep_dones.append(terminated)
                 
                 obs = next_obs
-                goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, worker_device)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=worker_device)
-                total_step_rewards = rewards_tensor + goal_rewards_tensor
-                episode_reward_tensor += total_step_rewards
+                
+            episode_length = len(ep_states)
 
-                for i in range(config['num_agents']):   
-                    if rewards[i] :
-                        num_get_obs_rewards_list[i] = 0
-
-
+            if episode_length < seq_len:
+                # 计算需要填充多少步
+                padding_needed = seq_len - episode_length
+                
+                # 填充所有列表
+                ep_states.extend([empty_obs_np] * padding_needed)
+                ep_actions.extend([empty_action_np] * padding_needed)
+                ep_rewards.extend([empty_reward_list] * padding_needed)
+                ep_next_states.extend([empty_obs_np] * padding_needed) # 下一个状态也是空的
+                ep_dones.extend([empty_done_list] * padding_needed) # 标记为 "Done"
+            
+            # 现在，所有回合（无论长短）都至少是 seq_len 长
+            # 如果回合长于 seq_len，回放池的采样会自动处理
             task_agent.replay_buffer.push({
                 'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
                 'next_states': ep_next_states, 'dones': ep_dones
             })
+
+
             current_task_episodes += 1
-            current_task_rewards.append(episode_reward_tensor.cpu().numpy())
+            current_task_rewards.append(reward_calculator.total_rewards())
 
         # --- 阶段 2: 训练 ---
         inner_losses = []
@@ -150,243 +165,6 @@ def reptile_worker(args):
         traceback.print_exc()
         return (None, 0, 0, 0)
 
-# 定义DRQN网络
-class CnnQnet(nn.Module):
-    def __init__(self, input_shape, num_actions):
-        super(CnnQnet, self).__init__()
-        input_channels = input_shape[0]
-        self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-
-        # 计算CNN输出的特征数量
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, input_channels, input_shape[1], input_shape[2])
-            cnn_output_features = self.cnn(dummy_input).shape[1]
-
-        # 定义LSTM层
-        self.lstm_hidden_size = 512
-        self.lstm = nn.LSTM(
-            input_size = cnn_output_features, 
-            hidden_size = self.lstm_hidden_size, 
-            batch_first = True  # 确保输入形状是 (B, T, Features)
-        )
-
-        # 定义全连接层
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.lstm_hidden_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions)
-        )
-
-    def forward(self, x, hidden_state = None):
-        # x = torch.Tensor of shape (B, T, C, H, W) or (B, C, H, W)
-        # 输入 x 的形状: (B, T, C, H, W)or((B, C, H, W)
-        # B = Batch Size(智能体数量), T = Sequence Length (时间步长，在训练阶段为1，经验回放阶段等于采样的序列长度),
-        # C = Channels, H = Height, W = Width -> input_shape
-        if x.dim() == 5: # 经验回放阶段: (B, T, C, H, W)
-            B, T, C, H, W = x.shape
-        else: # 训练阶段: (B, C, H, W)
-            B, C, H, W = x.shape
-            T = 1
-            x = x.unsqueeze(1) # 增加时间维度 -> (B, 1, C, H, W)
-
-        # 通过CNN层
-        cnn_in = x.view(B * T, C, H, W)  # 将时间步长和批次合并以通过CNN
-        cnn_out = self.cnn(cnn_in)  # 通过CNN层 cnn_out: (B*T, Features)
-
-        # 通过LSTM层
-        lstm_in = cnn_out.view(B, T, -1)  # 重塑为 (B, T, Features) 以通过LSTM
-        lstm_out, new_hidden_state = self.lstm(lstm_in, hidden_state)  # lstm_out: (B, T, Hidden Size)
-
-        # 通过全连接层
-        fc_in = lstm_out.contiguous().view(B * T, -1)  # 展平为 (B*T, Hidden Size)
-        fc_out = self.fc_layers(fc_in)  # fc_out: (B*T, num_actions)
-        qvalues = fc_out.view(B, T, -1)  # 重塑为 (B, T, num_actions)
-
-        if T == 1:
-            qvalues = qvalues.squeeze(1)  # 如果时间步长为1，移除时间维度，输出形状为 (B, num_actions)  
-        return qvalues, new_hidden_state
-    
-#经验回放池
-class ReplayBuffer:
-    def __init__(self, capacity, seq_len, num_agents, obs_shape, device):
-        self.capacity = capacity
-        self.seq_len = seq_len
-        self.num_agents = num_agents
-        self.obs_shape = obs_shape
-        self.device = device
-        # 使用 deque (双端队列) 作为缓冲区，它在达到容量时会自动丢弃旧数据
-        self.buffer = deque(maxlen=capacity) 
-
-    def push(self, episode_data):
-        """
-            episode_data (dict): 包含以下键的字典:
-                'states': list of np.array, 每个元素形状为 (B, N, C, H, W)
-                'actions': list of int, 每个元素形状为 (B, N,)
-                'rewards': list of float, 每个元素形状为 (B, N,)
-                'next_states': list of np.array, 每个元素形状为 (B, N, C, H, W)
-                'dones': list of bool, 每个元素形状为 (B, N,)
-        """
-        # 确保 episode 至少有序列长度那么长（或处理更短的 episode）
-        if len(episode_data['states']) < self.seq_len:
-            return
-
-        self.buffer.append(episode_data)
-
-    def sample(self, batch_size):
-        # 检查是否有足够的 episode 可供采样
-        if len(self.buffer) < batch_size:
-            if not self.buffer:
-                return None
-            sampled_episodes = random.choices(self.buffer, k=batch_size) # 有放回采样
-        else:
-            sampled_episodes = random.sample(self.buffer, batch_size)
-
-        # 初始化列表来收集序列
-        batch_states = []
-        batch_actions = []
-        batch_rewards = []
-        batch_next_states = []
-        batch_dones = []
-
-        for episode in sampled_episodes:
-            # 随机选择一个起始点
-            start_idx = random.randint(0, len(episode['states']) - self.seq_len)
-            end_idx = start_idx + self.seq_len
-
-            # 截取序列 (注意：这里截取的是列表的列表)
-            batch_states.append(episode['states'][start_idx:end_idx])
-            batch_actions.append(episode['actions'][start_idx:end_idx])
-            batch_rewards.append(episode['rewards'][start_idx:end_idx])
-            batch_next_states.append(episode['next_states'][start_idx:end_idx])
-            batch_dones.append(episode['dones'][start_idx:end_idx])
-
-        # --- 关键：维度转换 ---
-        # 1. 转换为 Numpy 数组，方便进行维度转换
-        states_np = np.array(batch_states, dtype=np.float32)            # (B, T, N, C, H, W)
-        actions_np = np.array(batch_actions, dtype=np.int64)            # (B, T, N)
-        rewards_np = np.array(batch_rewards, dtype=np.float32)          # (B, T, N)
-        next_states_np = np.array(batch_next_states, dtype=np.float32)  # (B, T, N, C, H, W)
-        dones_np = np.array(batch_dones, dtype=np.float32)              # (B, T, N)
-
-        # 2. 交换 B 和 N 维度
-        states_np = states_np.transpose(0, 2, 1, 3, 4, 5)               # (B, N, T, C, H, W)
-        next_states_np = next_states_np.transpose(0, 2, 1, 3, 4, 5)     # (B, N, T, C, H, W)
-        actions_np = actions_np.transpose(0, 2, 1)                      # (B, N, T)
-        rewards_np = rewards_np.transpose(0, 2, 1)                      # (B, N, T)
-        dones_np = dones_np.transpose(0, 2, 1)                          # (B, N, T)
-
-        # 3. 合并 B 和 N 维度
-        #    形状: (B*N, T, ...)
-        batch_states_tensor = torch.tensor(states_np.reshape(-1, self.seq_len, *self.obs_shape), device=self.device)            # (B*N, T, C, H, W)
-        batch_next_states_tensor = torch.tensor(next_states_np.reshape(-1, self.seq_len, *self.obs_shape), device=self.device)  # (B*N, T, C, H, W)
-        batch_actions_tensor = torch.tensor(actions_np.reshape(-1, self.seq_len), device=self.device)                           # (B*N, T)  
-        batch_rewards_tensor = torch.tensor(rewards_np.reshape(-1, self.seq_len), device=self.device)                           # (B*N, T)
-        batch_dones_tensor = torch.tensor(dones_np.reshape(-1, self.seq_len), device=self.device)                               # (B*N, T)
-
-        return {
-            'states': batch_states_tensor,
-            'actions': batch_actions_tensor,
-            'rewards': batch_rewards_tensor,
-            'next_states': batch_next_states_tensor,
-            'dones': batch_dones_tensor
-        }
-
-    def __len__(self):
-        return len(self.buffer)
-
-# 定义DRQN智能体
-class DRQNAgent:
-    def __init__(self, num_agents, state_shape, num_actions, replay_buffer, lr):
-        # [修改] device 在这里定义，从主进程或 worker 传入
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.use_scaler = torch.cuda.is_available()
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler) #较旧的cuda版本请使用下一行代码并注释这一行
-        #self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)    
-        self.num_agents = num_agents
-        self.state_shape = state_shape
-        self.num_actions = num_actions
-        self.lr = lr
-        self.q_net = CnnQnet(state_shape, num_actions).to(self.device)
-        self.target_q_net = CnnQnet(state_shape, num_actions).to(self.device)
-        self.target_q_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
-        self.replay_buffer = replay_buffer
-        self.gamma = 0.99
-        self.batch_size = 32
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.9999995
-        self.epsilon_min = 0.1
-        self.update_target_steps = 100
-        self.step_count = 0
-
-    def select_actions(self, states, current_hidden_state): #states: (N, C, H, W)
-        self.q_net.eval()
-        with torch.no_grad():
-            q_values, new_hidden_state = self.q_net(states, current_hidden_state)
-        self.q_net.train()
-
-        greedy_actions = q_values.argmax(dim=-1)  # (N,)
-        random_actions = torch.randint(0, self.num_actions, (states.shape[0],), device=self.device)  # (N,)
-
-        is_random = torch.rand(states.shape[0], device=self.device) < self.epsilon
-        actions = torch.where(is_random, random_actions, greedy_actions)  # (N,)
-        return actions.cpu().numpy(), new_hidden_state
-    
-    def train(self):
-        batch = self.replay_buffer.sample(self.batch_size)
-        if batch is None:
-            return None
-        
-        # batch 已经在创建时被放到了正确的 device 上
-        states = batch['states']          # (B*N, T, C, H, W)
-        actions = batch['actions']        # (B*N, T)
-        rewards = batch['rewards']        # (B*N, T)
-        next_states = batch['next_states']# (B*N, T, C, H, W)
-        dones = batch['dones']            # (B*N, T)
-
-        with torch.cuda.amp.autocast():
-            # 计算当前 Q 值
-            q_values, _ = self.q_net(states)                                   # (B*N, T, num_actions)
-            q_values = q_values.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # (B*N, T)
-
-            # 计算目标 Q 值
-            with torch.no_grad():
-                #使用主网络找到最佳动作
-                q_values_main_net, _ = self.q_net(next_states)          # (B*N, T, num_actions)
-                next_actions = q_values_main_net.argmax(dim=-1)         # (B*N, T)
-                #用目标网络评估这些动作的价值
-                next_q_values_target_net, _ = self.target_q_net(next_states)  # (B*N, T, num_actions)
-                # 使用 gather 挑选出价值
-                target_next_q_values = torch.gather(next_q_values_target_net, 2, next_actions.unsqueeze(-1)).squeeze(-1)  # (B*N, T)
-                #贝尔曼方程计算目标 Q 值
-                target_q_values = rewards + self.gamma * target_next_q_values * (1 - dones)  # (B*N, T)
-            # 计算损失
-            loss = nn.MSELoss()(q_values, target_q_values)
-
-        # 优化网络 (使用 scaler)
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        # 更新目标网络
-        if self.step_count % self.update_target_steps == 0:
-            self.target_q_net.load_state_dict(self.q_net.state_dict())
-
-        # [修改] worker 不应该衰减 meta-epsilon
-        # 它只衰减自己的 epsilon，这对探索是必要的
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-        self.step_count += 1
-
-        return loss.item()
 
 # 定义 Reptile 元学习算法
 class Reptile:
@@ -524,18 +302,12 @@ class Reptile:
                 meta_weights_cpu = {k: v.cpu() for k, v in self.meta_agent.q_net.state_dict().items()}
                 current_meta_epsilon = self.meta_agent.epsilon
                 
-                # --- 2. 采样 B 个任务 ---
+                # --- 2. 采样parallel_batch_size个任务 ---
                 args_list = []
                 # tasks_in_batch_names = [] # 用于日志
                 for _ in range(self.parallel_batch_size):
-                    """ task_set_name = random.choice(list(self.task_sets.keys()))
-                    task_set = self.all_task_sets[task_set_name]
-                    if not task_set:
-                        print(f"警告：任务集 {task_set_name} 为空，跳过一个任务。")
-                        continue """
-                    task_env = task_environment.create_task_env()
-                    
-                    # tasks_in_batch_names.append(task_set_name)
+                    task_env, map_type, seed, num_targets = task_environment.create_task_env()
+                   
                     args_list.append((task_env, meta_weights_cpu, current_meta_epsilon, self.worker_config))
 
                 if not args_list:

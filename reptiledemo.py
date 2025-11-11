@@ -10,7 +10,8 @@ from collections import deque
 import time
 import os
 import task_environment
-from mpreptile_optimized import goal_in_obs_reward_multi_agent
+from module_set import RewardSet, CnnQnet, ReplayBuffer, DRQNAgent
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -328,7 +329,6 @@ class Reptile:
         print(f"开始 Reptile 元学习训练 (共 {self.meta_iterations} 次迭代)...")
         start_time = time.time()
         total_episodes_run = 0
-        total_steps_collected = 0
         # 修正：记录所有内部训练步骤的损失，而不仅仅是每个 meta iter 的平均值
         all_inner_step_losses = []
         # 修正：跟踪 meta_agent 的总训练步数，用于 epsilon 衰减
@@ -354,8 +354,18 @@ class Reptile:
 
                 # --- 内循环 ---
                 current_task_episodes = 0
-                current_task_steps = 0
                 current_task_rewards = []
+                
+                # 为填充（padding）准备“空”数据
+                # (N, C, H, W)
+                empty_obs_np = np.zeros((self.num_agents, *self.state_shape), dtype=np.float32) 
+                  # (N,)
+                empty_action_np = np.zeros(self.num_agents, dtype=np.int64)
+                # (N,)
+                empty_reward_list = [0.0] * self.num_agents 
+                # (N,)
+                empty_done_list = [True] * self.num_agents
+        
 
                 # 阶段 1: 收集经验 (保持不变)
                 while current_task_episodes < self.episodes_per_task:
@@ -364,44 +374,31 @@ class Reptile:
                     current_hidden_state = None
                     terminated = [False] * self.num_agents
                     truncated = [False] * self.num_agents
-                    episode_reward_tensor = torch.zeros(self.num_agents, dtype=torch.float32, device=device)
-                    num_get_obs_rewards_list = [0] * self.num_agents
+                    reward_calculator = RewardSet()
         
                     while not (all(terminated) or all(truncated)):
                         obs_np = np.array(obs)
                         states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=device)
                         # 使用 task_agent 的 epsilon 进行探索
-                        actions_np, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
+                        actions, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
                         current_hidden_state = new_hidden_state
-                        next_obs, rewards, terminated, truncated, info = task_env.step(actions_np)
+                        next_obs, rewards, terminated, truncated, info = task_env.step(actions)
                         next_obs_np = np.array(next_obs)
+
+                        rewards_tensor = reward_calculator.calculate_total_reward(rewards, states_tensor, actions) 
+
                         ep_states.append(obs_np)
-                        ep_actions.append(actions_np)
-                        ep_rewards.append(rewards)
+                        ep_actions.append(actions)
+                        ep_rewards.append(rewards_tensor.tolist())
                         ep_next_states.append(next_obs_np)
                         ep_dones.append(terminated)
 
                         obs = next_obs
-                        goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, device)
-                        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
-                        total_step_rewards = rewards_tensor + goal_rewards_tensor
-                        episode_reward_tensor += total_step_rewards
-
-                        current_task_steps += 1
-
-                        for i in range(self.num_agents):   
-                            if rewards[i] :
-                                num_get_obs_rewards_list[i] = 0
-
-                    task_agent.replay_buffer.push({
-                        'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
-                        'next_states': ep_next_states, 'dones': ep_dones
-                    })
+                        
                     current_task_episodes += 1
-                    current_task_rewards.append(episode_reward_tensor.cpu().numpy())
+                    current_task_rewards.append(reward_calculator.total_rewards())
 
                 total_episodes_run += current_task_episodes
-                total_steps_collected += current_task_steps
 
                 # --- 阶段 2: 训练 ---
                 inner_losses_current_iter = [] # 只记录当前 meta iter 的损失用于平均

@@ -2,67 +2,17 @@
 #pytorch: 2.1.2 python: 3.10 cuda:11.8
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import random
-import pogema
-from collections import deque
 import time
 import os
 import torch.multiprocessing as mp
 import task_environment
-
+from module_set import RewardSet, CnnQnet, ReplayBuffer, DRQNAgent
 
 
 # 检查观察中是否存在目标的奖励函数
-def goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, device):
-    """
-    检查观察中是否存在目标，并为每个智能体返回单独的奖励。
 
-    Args:
-        states_tensor (torch.Tensor): 形状为 (B, C, H, W) 的观测张量，B 是智能体数量。
-        num_get_obs_rewards_list (list[int]): 形状为 (B,) 的列表，跟踪每个智能体的计数值。
-        device (torch.device): GPU 或 CPU。
-
-    Returns:
-        torch.Tensor: 形状为 (B,) 的奖励张量，例如 [1.0, 0.0, 1.0]
-        list[int]: 更新后的计数值列表。
-    """
-    
-    B, C, H, W = states_tensor.shape
-    
-    # 1. 获取目标通道 (B, H, W)
-    target_channel_tensor = states_tensor[:, 2, :, :]  #
-
-    # 2. 初始化 B 个奖励
-    rewards_tensor = torch.zeros(B, dtype=torch.float32, device=device)
-
-    # 3. 逐个智能体检查
-    for i in range(B):
-        # 3a. 获取该智能体已获得的奖励次数
-        num_rewards_agent_i = num_get_obs_rewards_list[i]
-        
-        # 3b. 计算该智能体的视野遮罩
-        idx = min(num_rewards_agent_i, H // 2) #
-        check_tensor_2d = torch.zeros((H, W), dtype=torch.float32, device=device) #
-        check_tensor_2d[idx : H - idx, idx : W - idx] = 1.0 #
-        
-        # 3c. 只检查第 i 个智能体的视野
-        agent_i_obs = target_channel_tensor[i, :, :] # 形状 (H, W)
-        
-        # 3d. 应用遮罩并求和
-        goal_in_obs = agent_i_obs * check_tensor_2d #
-        
-        # 3e. 如果该智能体看到目标，给予奖励
-        if goal_in_obs.sum() > 0: #
-            rewards_tensor[i] = 1.0
-            
-            # 并且更新该智能体的计数值
-            num_get_obs_rewards_list[i] += 1
-
-    return rewards_tensor, num_get_obs_rewards_list
 
 # -------------------------------------------------------------------
 # [优化] 工作函数 (Worker Function)
@@ -88,17 +38,21 @@ def reptile_worker(args):
         # 2. [优化] 即时(JIT)创建环境
         task_env, map_type, seed, num_targets = task_environment.create_task_env()
 
+        num_agents = worker_config['num_agents']
+        seq_len = worker_config['seq_len']
+        state_shape = worker_config['state_shape']
+
         # 3. 重新创建 task_agent
         task_buffer = ReplayBuffer(
             worker_config['replay_buffer_capacity'],
-            worker_config['seq_len'],
-            worker_config['num_agents'],
-            worker_config['state_shape'],
+            seq_len,
+            num_agents,
+            state_shape,
             worker_device
         )
         task_agent = DRQNAgent(
-            worker_config['num_agents'],
-            worker_config['state_shape'],
+            num_agents,
+            state_shape,
             worker_config['num_actions'],
             task_buffer,
             worker_config['inner_lr']
@@ -123,51 +77,67 @@ def reptile_worker(args):
         # --- 阶段 1: 收集经验 ---
         current_task_episodes = 0
         current_task_rewards = []
+
+        # 为填充（padding）准备“空”数据
+        # (N, C, H, W)
+        empty_obs_np = np.zeros((num_agents, *state_shape), dtype=np.float32) 
+         # (N,)
+        empty_action_np = np.zeros(num_agents, dtype=np.int64)
+        # (N,)
+        empty_reward_list = [0.0] * num_agents 
+        # (N,)
+        empty_done_list = [True] * num_agents
         
         while current_task_episodes < worker_config['episodes_per_task']:
             ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = [], [], [], [], []
             obs, info = task_env.reset()
             current_hidden_state = None
-            terminated = [False] * worker_config['num_agents']
-            truncated = [False] * worker_config['num_agents']
-            episode_reward_tensor = torch.zeros(worker_config['num_agents'], dtype=torch.float32, device=worker_device)
-            num_get_obs_rewards_list = [0] * worker_config['num_agents']
+            terminated = [False] * num_agents
+            truncated = [False] * num_agents
+            reward_calculator = RewardSet(num_agents, worker_device)
             
             while not (all(terminated) or all(truncated)): # 修改终止条件以确保达到目标数量
                 obs_np = np.array(obs)
                 states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=worker_device)
                 
-                actions_np, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
+                actions, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
                 current_hidden_state = new_hidden_state
                 
-                next_obs, rewards, terminated, truncated, info = task_env.step(actions_np)
+                next_obs, rewards, terminated, truncated, info = task_env.step(actions)
                 next_obs_np = np.array(next_obs)
 
+                rewards_tensor = reward_calculator.calculate_total_reward(rewards, states_tensor, actions) 
+
                 ep_states.append(obs_np)
-                ep_actions.append(actions_np)
-                ep_rewards.append(rewards)
+                ep_actions.append(actions)
+                ep_rewards.append(rewards_tensor.tolist())
                 ep_next_states.append(next_obs_np)
                 ep_dones.append(terminated)
                 
                 obs = next_obs
-                goal_rewards_tensor, num_get_obs_rewards_list = goal_in_obs_reward_multi_agent(states_tensor, num_get_obs_rewards_list, worker_device)
-                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=worker_device)
-                total_step_rewards = rewards_tensor + goal_rewards_tensor
-                episode_reward_tensor += total_step_rewards
+                
+            episode_length = len(ep_states)
 
-                for i in range(worker_config['num_agents']):   
-                    if rewards[i] :
-                        num_get_obs_rewards_list[i] = 0
-
-            # 确保 episode 足够长
-            if len(ep_states) >= worker_config['seq_len']:
-                 task_agent.replay_buffer.push({
-                    'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
-                    'next_states': ep_next_states, 'dones': ep_dones
-                })
+            if episode_length < seq_len:
+                # 计算需要填充多少步
+                padding_needed = seq_len - episode_length
+                
+                # 填充所有列表
+                ep_states.extend([empty_obs_np] * padding_needed)
+                ep_actions.extend([empty_action_np] * padding_needed)
+                ep_rewards.extend([empty_reward_list] * padding_needed)
+                ep_next_states.extend([empty_obs_np] * padding_needed) # 下一个状态也是空的
+                ep_dones.extend([empty_done_list] * padding_needed) # 标记为 "Done"
+            
+            # 现在，所有回合（无论长短）都至少是 seq_len 长
+            # 如果回合长于 seq_len，回放池的采样会自动处理
+            task_agent.replay_buffer.push({
+                'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
+                'next_states': ep_next_states, 'dones': ep_dones
+            })
             
             current_task_episodes += 1
-            current_task_rewards.append(episode_reward_tensor.cpu().numpy()) # 只记录第一个智能体的奖励
+            current_task_rewards.append(reward_calculator.total_rewards()) 
 
         # --- 阶段 2: 训练 ---
         inner_losses = []
@@ -206,201 +176,6 @@ def reptile_worker(args):
         if 'task_env' in locals() and hasattr(task_env, 'close'):
             task_env.close()
 
-# 定义DRQN网络
-class CnnQnet(nn.Module):
-    def __init__(self, input_shape, num_actions):
-        super(CnnQnet, self).__init__()
-        input_channels = input_shape[0]
-        self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
-
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, input_channels, input_shape[1], input_shape[2])
-            cnn_output_features = self.cnn(dummy_input).shape[1]
-
-        self.lstm_hidden_size = 512
-        self.lstm = nn.LSTM(
-            input_size = cnn_output_features, 
-            hidden_size = self.lstm_hidden_size, 
-            batch_first = True
-        )
-
-        self.fc_layers = nn.Sequential(
-            nn.Linear(self.lstm_hidden_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions)
-        )
-
-    def forward(self, x, hidden_state = None):
-        if x.dim() == 5: # (B, T, C, H, W)
-            B, T, C, H, W = x.shape
-        else: # (B, C, H, W)
-            B, C, H, W = x.shape
-            T = 1
-            x = x.unsqueeze(1) # (B, 1, C, H, W)
-
-        cnn_in = x.view(B * T, C, H, W)
-        cnn_out = self.cnn(cnn_in)
-
-        lstm_in = cnn_out.view(B, T, -1)
-        lstm_out, new_hidden_state = self.lstm(lstm_in, hidden_state)
-
-        fc_in = lstm_out.contiguous().view(B * T, -1)
-        fc_out = self.fc_layers(fc_in)
-        qvalues = fc_out.view(B, T, -1)
-
-        if T == 1:
-            qvalues = qvalues.squeeze(1)
-        return qvalues, new_hidden_state
-    
-#经验回放池
-class ReplayBuffer:
-    def __init__(self, capacity, seq_len, num_agents, obs_shape, device):
-        self.capacity = capacity
-        self.seq_len = seq_len
-        self.num_agents = num_agents
-        self.obs_shape = obs_shape
-        self.device = device
-        self.buffer = deque(maxlen=capacity) 
-
-    def push(self, episode_data):
-
-        self.buffer.append(episode_data)
-
-    def sample(self, batch_size):
-        if len(self.buffer) < batch_size:
-            if not self.buffer:
-                return None
-            sampled_episodes = random.choices(self.buffer, k=batch_size)
-        else:
-            sampled_episodes = random.sample(self.buffer, batch_size)
-
-        batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = [], [], [], [], []
-
-        for episode in sampled_episodes:
-            start_idx = random.randint(0, len(episode['states']) - self.seq_len)
-            end_idx = start_idx + self.seq_len
-
-            batch_states.append(episode['states'][start_idx:end_idx])
-            batch_actions.append(episode['actions'][start_idx:end_idx])
-            batch_rewards.append(episode['rewards'][start_idx:end_idx])
-            batch_next_states.append(episode['next_states'][start_idx:end_idx])
-            batch_dones.append(episode['dones'][start_idx:end_idx])
-
-        states_np = np.array(batch_states, dtype=np.float32)
-        actions_np = np.array(batch_actions, dtype=np.int64)
-        rewards_np = np.array(batch_rewards, dtype=np.float32)
-        next_states_np = np.array(batch_next_states, dtype=np.float32)
-        dones_np = np.array(batch_dones, dtype=np.float32)
-
-        states_np = states_np.transpose(0, 2, 1, 3, 4, 5)
-        next_states_np = next_states_np.transpose(0, 2, 1, 3, 4, 5)
-        actions_np = actions_np.transpose(0, 2, 1)
-        rewards_np = rewards_np.transpose(0, 2, 1)
-        dones_np = dones_np.transpose(0, 2, 1)
-
-        batch_states_tensor = torch.tensor(states_np.reshape(-1, self.seq_len, *self.obs_shape), device=self.device)
-        batch_next_states_tensor = torch.tensor(next_states_np.reshape(-1, self.seq_len, *self.obs_shape), device=self.device)
-        batch_actions_tensor = torch.tensor(actions_np.reshape(-1, self.seq_len), device=self.device)
-        batch_rewards_tensor = torch.tensor(rewards_np.reshape(-1, self.seq_len), device=self.device)
-        batch_dones_tensor = torch.tensor(dones_np.reshape(-1, self.seq_len), device=self.device)
-
-        return {
-            'states': batch_states_tensor,
-            'actions': batch_actions_tensor,
-            'rewards': batch_rewards_tensor,
-            'next_states': batch_next_states_tensor,
-            'dones': batch_dones_tensor
-        }
-
-    def __len__(self):
-        return len(self.buffer)
-
-# 定义DRQN智能体
-class DRQNAgent:
-    def __init__(self, num_agents, state_shape, num_actions, replay_buffer, lr):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # [优化] 仅当在 CUDA 上时才使用 GradScaler
-        self.use_scaler = torch.cuda.is_available()
-        
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler) #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
-        # self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler) 
-        
-        self.num_agents = num_agents
-        self.state_shape = state_shape
-        self.num_actions = num_actions
-        self.lr = lr
-        self.q_net = CnnQnet(state_shape, num_actions).to(self.device)
-        self.target_q_net = CnnQnet(state_shape, num_actions).to(self.device)
-        self.target_q_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
-        self.replay_buffer = replay_buffer
-        self.gamma = 0.99
-        self.batch_size = 32
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.999999955
-        self.epsilon_min = 0.1
-        self.update_target_steps = 100
-        self.step_count = 0
-
-    def select_actions(self, states, current_hidden_state):
-        self.q_net.eval()
-        with torch.no_grad():
-            q_values, new_hidden_state = self.q_net(states, current_hidden_state)
-        self.q_net.train()
-
-        greedy_actions = q_values.argmax(dim=-1)
-        random_actions = torch.randint(0, self.num_actions, (states.shape[0],), device=self.device)
-        is_random = torch.rand(states.shape[0], device=self.device) < self.epsilon
-        actions = torch.where(is_random, random_actions, greedy_actions)
-        return actions.cpu().numpy(), new_hidden_state
-    
-    def train(self):
-        batch = self.replay_buffer.sample(self.batch_size)
-        if batch is None:
-            return None
-        
-        states = batch['states']
-        actions = batch['actions']
-        rewards = batch['rewards']
-        next_states = batch['next_states']
-        dones = batch['dones']
-
-        # [优化] 明确启用 autocast
-        
-        with torch.cuda.amp.autocast(enabled=self.use_scaler):   #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
-        #with torch.amp.autocast('cuda', enabled=self.use_scaler):
-            q_values, _ = self.q_net(states)
-            q_values = q_values.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-
-            with torch.no_grad():
-                q_values_main_net, _ = self.q_net(next_states)
-                next_actions = q_values_main_net.argmax(dim=-1)
-                next_q_values_target_net, _ = self.target_q_net(next_states)
-                target_next_q_values = torch.gather(next_q_values_target_net, 2, next_actions.unsqueeze(-1)).squeeze(-1)
-                target_q_values = rewards + self.gamma * target_next_q_values * (1 - dones)
-            
-            loss = nn.MSELoss()(q_values, target_q_values)
-
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        if self.step_count % self.update_target_steps == 0:
-            self.target_q_net.load_state_dict(self.q_net.state_dict())
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-        self.step_count += 1
-        return loss.item()
 
 # 定义 Reptile 元学习算法
 class Reptile:
