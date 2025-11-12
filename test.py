@@ -1,4 +1,3 @@
-import mpreptile_optimized
 import task_environment
 import torch
 import numpy as np
@@ -47,6 +46,7 @@ class TestAgent(DRQNAgent):
         self.epsilon_decay = 0.99
         total_steps_trained = 0
         all_finetune_losses = []
+        ep_len = 0
 
         # 为填充（padding）准备“空”数据
         # (N, C, H, W)
@@ -64,7 +64,7 @@ class TestAgent(DRQNAgent):
             current_hidden_state = None
             terminated = [False] * self.num_agents
             truncated = [False] * self.num_agents
-            reward_calculator = RewardSet()
+            reward_calculator = RewardSet(self.num_agents, device=self.device)
 
             while not (all(terminated) or all(truncated)): # 修改终止条件以确保达到目标数量
                 obs_np = np.array(obs)
@@ -84,7 +84,7 @@ class TestAgent(DRQNAgent):
                 ep_next_states.append(next_obs_np)
                 ep_dones.append(terminated)
                 
-                obs = next_obs
+                obs = next_obs 
                 
             episode_length = len(ep_states)
 
@@ -106,14 +106,15 @@ class TestAgent(DRQNAgent):
                 'next_states': ep_next_states, 'dones': ep_dones
             })
             
-            current_task_episodes += 1
 
-            if len(self.replay_buffer) >= self.batch_size:
+            if len(self.replay_buffer) > 0:
                 for _ in range(num_steps_per_train): 
                     loss = self.train()
                     if loss is not None:
                          all_finetune_losses.append(loss)
                          total_steps_trained += 1
+
+            print(f"回合 {ep+1}/{num_episodes} 完成! 步数: {episode_length}, 总奖励: {reward_calculator.total_rewards()}")
 
         avg_finetune_loss = np.mean(all_finetune_losses) if all_finetune_losses else 0
         print(f"微调完成。共训练 {total_steps_trained} 步。平均损失: {avg_finetune_loss:.4f}")
@@ -150,8 +151,7 @@ class TestAgent(DRQNAgent):
         original_epsilon = self.epsilon
         self.epsilon = 0.0 
         self.q_net.eval() 
-        num_get_obs_rewards_list = [0] * self.num_agents
-        reward_calculator = RewardSet()
+        reward_calculator = RewardSet(self.num_agents, device=self.device)
 
         with torch.no_grad():
             while not (all(terminated) or all(truncated)):
@@ -181,7 +181,7 @@ class TestAgent(DRQNAgent):
 
 if __name__ == "__main__":
 
-    test_agent = mpreptile_optimized.TestAgent(
+    test_agent = TestAgent(
             state_shape=(3, 11, 11),
             num_actions=5,
             state_dict_file_path='reptile_drqn_meta_agent_interrupt.pth',
