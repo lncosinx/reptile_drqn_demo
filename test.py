@@ -191,9 +191,6 @@ if __name__ == "__main__":
             seq_len=24,
             num_agents_to_test=1
         )
-    # 重新设置batch size防止len(self.replay_buffer) >= self.batch_size永远为False
-    # 因为这里的self.batch_size在DRQNAgent中被设置为256，导致这个条件不会被触发
-    test_agent.batch_size = 4   
     env, _ ,_ ,_ = task_environment.create_task_env()
     test_agent.evaluate(env, render_animation=True, animation_filename="not_fine_tune.svg")
     test_agent.fine_tune_on_task(env, num_episodes=20, num_steps_per_train=32)                # 微调
