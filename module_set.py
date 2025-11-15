@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import random
-from collections import deque
-
 
 # 定义奖励计算类
 class RewardSet:
@@ -132,11 +130,94 @@ class RewardSet:
         else:
             return self.total_episode_reward.cpu().numpy()
     
+class SumTree:
+    """
+    SumTree 数据结构，用于高效地按优先级采样。
+    树的叶节点存储优先级 (p)，内部节点存储其子节点的总和。
+    """
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # 树的层级结构。
+        # 0: [-------------Root-------------]
+        # 1: [---Child 1---] [---Child 2---]
+        # ...
+        # N: [p1] [p2] [p3] ... [p_capacity]
+        # 实际的树数组大小为 2 * capacity - 1
+        self.tree = np.zeros(2 * capacity - 1)
+        # self.data 存储实际的 (s, a, r, s') 转换或 (episode_data)
+        self.data = np.zeros(capacity, dtype=object)
+        
+        self.data_pointer = 0 # 指向 self.data 中的下一个写入位置
+        self.n_entries = 0    # 缓冲区中的实际条目数
 
-# 定义DRQN网络
-class CnnQnet(nn.Module):
+    def _propagate(self, tree_index, change):
+        """将优先级的变化向上（向根）传播"""
+        parent_index = (tree_index - 1) // 2
+        self.tree[parent_index] += change
+        
+        # 递归传播直到根节点 (index 0)
+        if parent_index != 0:
+            self._propagate(parent_index, change)
+
+    def _retrieve(self, tree_index, s):
+        """
+        在树中查找与采样值 's' 对应的叶节点
+        """
+        left_child_index = 2 * tree_index + 1
+        right_child_index = left_child_index + 1
+
+        # 如果我们到达了叶节点，则返回它
+        if left_child_index >= len(self.tree):
+            return tree_index
+
+        if s <= self.tree[left_child_index]:
+            return self._retrieve(left_child_index, s)
+        else:
+            return self._retrieve(right_child_index, s - self.tree[left_child_index])
+
+    def total(self):
+        """返回总优先级（根节点的值）"""
+        return self.tree[0]
+
+    def add(self, priority, data):
+        """在树中添加一个新条目 (data) 及其优先级 (priority)"""
+        # 找到要写入的叶节点索引 (在树数组中的位置)
+        # 它与 self.data_pointer 相关，但偏移了 capacity - 1
+        tree_index = self.data_pointer + self.capacity - 1
+        
+        self.data[self.data_pointer] = data
+        
+        # 更新优先级
+        self.update(tree_index, priority)
+
+        # 移动指针（循环缓冲区）
+        self.data_pointer += 1
+        if self.data_pointer >= self.capacity:
+            self.data_pointer = 0
+            
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
+
+    def update(self, tree_index, priority):
+        """更新一个叶节点的优先级并向上传播变化"""
+        change = priority - self.tree[tree_index]
+        self.tree[tree_index] = priority
+        self._propagate(tree_index, change)
+
+    def get_leaf(self, s):
+        """根据采样值 's' 获取叶节点索引、优先级和数据"""
+        leaf_index = self._retrieve(0, s)
+        data_index = leaf_index - self.capacity + 1
+        
+        return leaf_index, self.tree[leaf_index], self.data[data_index]
+
+    def __len__(self):
+        return self.n_entries
+
+# 定义 DRQN 网络
+class CRnnQnet(nn.Module):
     def __init__(self, input_shape, num_actions):
-        super(CnnQnet, self).__init__()
+        super(CRnnQnet, self).__init__()
         input_channels = input_shape[0]
         self.cnn = nn.Sequential(
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
@@ -148,11 +229,11 @@ class CnnQnet(nn.Module):
 
         with torch.no_grad():
             dummy_input = torch.zeros(1, input_channels, input_shape[1], input_shape[2])
-            cnn_output_features = self.cnn(dummy_input).shape[1]
+            self.cnn_output_features = self.cnn(dummy_input).shape[1]
 
         self.lstm_hidden_size = 512
         self.lstm = nn.LSTM(
-            input_size = cnn_output_features, 
+            input_size = self.cnn_output_features, 
             hidden_size = self.lstm_hidden_size, 
             batch_first = True
         )
@@ -183,43 +264,92 @@ class CnnQnet(nn.Module):
 
         if T == 1:
             qvalues = qvalues.squeeze(1)
-        return qvalues, new_hidden_state
-    
+        return qvalues, new_hidden_state   
 
-#经验回放池
-class ReplayBuffer:
-    def __init__(self, capacity, seq_len, num_agents, obs_shape, device):
+# 经验回放池
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, seq_len, num_agents, obs_shape, device,
+                 alpha=0.6, beta_start=0.4, beta_frames=100000):
+        
+        self.tree = SumTree(capacity)
         self.capacity = capacity
         self.seq_len = seq_len
         self.num_agents = num_agents
         self.obs_shape = obs_shape
         self.device = device
-        self.buffer = deque(maxlen=capacity) 
-
+        
+        # PER 超参数
+        self.alpha = alpha               # [0~1] 优先级 p_i = (TD_error + epsilon)^alpha
+        self.beta_start = beta_start     # [0~1] IS 权重 w_i = (N * P(i))^(-beta)
+        self.beta = beta_start
+        self.beta_increment = (1.0 - beta_start) / beta_frames
+        self.epsilon = 0.01              # 用于 p_i 计算，避免 0 优先级
+        self.max_priority = 1.0          # 新条目的初始优先级，确保它们被采样
+        
     def push(self, episode_data):
-
-        self.buffer.append(episode_data)
+        """
+        存储一个完整的回合数据，并赋予其最大优先级，
+        以确保新数据至少被采样一次。
+        """
+        self.tree.add(self.max_priority, episode_data)
 
     def sample(self, batch_size):
-        if len(self.buffer) < batch_size:
-            if not self.buffer:
-                return None
-            sampled_episodes = random.choices(self.buffer, k=batch_size)    #有放回采样
-        else:
-            sampled_episodes = random.sample(self.buffer, batch_size)   #无放回采样
+        if len(self.tree) == 0:
+            return None
 
+        # 准备批次数据
         batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = [], [], [], [], []
+        
+        # 存储用于更新优先级的树索引和用于 IS 权重的优先级
+        tree_indices = np.empty(batch_size, dtype=np.int32)
+        sample_priorities = np.empty(batch_size, dtype=np.float32)
 
-        for episode in sampled_episodes:
-            start_idx = random.randint(0, len(episode['states']) - self.seq_len)
+        # 1. 计算总优先级和分段
+        total_p = self.tree.total()
+        segment = total_p / batch_size
+
+        # 2. 采样
+        for i in range(batch_size):
+            # 从每个分段中均匀采样一个值
+            a = segment * i
+            b = segment * (i + 1)
+            s = random.uniform(a, b)
+
+            # 3. 获取数据
+            tree_idx, priority, episode_data = self.tree.get_leaf(s)
+            
+            if not isinstance(episode_data, dict):
+                # 缓冲区中可能存在尚未被覆盖的 0
+                continue 
+
+            # 4. 从采样的回合中随机选择一个序列（与原 ReplayBuffer 相同）
+            start_idx = random.randint(0, len(episode_data['states']) - self.seq_len)
             end_idx = start_idx + self.seq_len
+            
+            batch_states.append(episode_data['states'][start_idx:end_idx])
+            batch_actions.append(episode_data['actions'][start_idx:end_idx])
+            batch_rewards.append(episode_data['rewards'][start_idx:end_idx])
+            batch_next_states.append(episode_data['next_states'][start_idx:end_idx])
+            batch_dones.append(episode_data['dones'][start_idx:end_idx])
+            
+            tree_indices[i] = tree_idx
+            sample_priorities[i] = priority
 
-            batch_states.append(episode['states'][start_idx:end_idx])
-            batch_actions.append(episode['actions'][start_idx:end_idx])
-            batch_rewards.append(episode['rewards'][start_idx:end_idx])
-            batch_next_states.append(episode['next_states'][start_idx:end_idx])
-            batch_dones.append(episode['dones'][start_idx:end_idx])
+        # 5. 计算重要性采样 (IS) 权重
+        # P(i) = priority_i / total_p
+        sampling_probabilities = sample_priorities / total_p
+        
+        # w_i = (N * P(i))^(-beta)
+        # N = len(self.tree)
+        weights = np.power(self.tree.n_entries * sampling_probabilities, -self.beta)
+        
+        # 归一化权重（为了稳定性）
+        weights /= weights.max()
+        
+        # 6. 退火 beta
+        self.beta = min(1.0, self.beta + self.beta_increment)
 
+        # --- 7. 格式化批次数据 (与原 ReplayBuffer 相同) ---
         states_np = np.array(batch_states, dtype=np.float32)
         actions_np = np.array(batch_actions, dtype=np.int64)
         rewards_np = np.array(batch_rewards, dtype=np.float32)
@@ -237,20 +367,40 @@ class ReplayBuffer:
         batch_actions_tensor = torch.tensor(actions_np.reshape(-1, self.seq_len), device=self.device)
         batch_rewards_tensor = torch.tensor(rewards_np.reshape(-1, self.seq_len), device=self.device)
         batch_dones_tensor = torch.tensor(dones_np.reshape(-1, self.seq_len), device=self.device)
+        
+        is_weights_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
 
-        return {
+        batch_data = {
             'states': batch_states_tensor,
             'actions': batch_actions_tensor,
             'rewards': batch_rewards_tensor,
             'next_states': batch_next_states_tensor,
             'dones': batch_dones_tensor
         }
+        
+        # 返回批次数据、对应的树索引和 IS 权重
+        return (batch_data, tree_indices, is_weights_tensor)
+
+    def update_priorities(self, tree_indices, td_errors):
+        """
+        在训练后，根据 TD-Errors 更新采样的回合的优先级。
+        
+        Args:
+            tree_indices (np.ndarray): sample() 返回的索引
+            td_errors (np.ndarray): 批次中每个回合的（平均）TD-Error
+        """
+        
+        # p_i = (|TD_error| + epsilon)^alpha
+        priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
+        priorities = np.clip(priorities, 0.001, self.max_priority)
+        
+        for idx, p in zip(tree_indices, priorities):
+            self.tree.update(idx, p)
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.tree)
 
-
-# 定义DRQN智能体
+# 定义 DRQN 智能体
 class DRQNAgent:
     def __init__(self, num_agents, state_shape, num_actions, replay_buffer, lr):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -258,15 +408,15 @@ class DRQNAgent:
         # [优化] 仅当在 CUDA 上时才使用 GradScaler
         self.use_scaler = torch.cuda.is_available()
         
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler) #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
-        # self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler) 
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler) #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler) 
         
         self.num_agents = num_agents
         self.state_shape = state_shape
         self.num_actions = num_actions
         self.lr = lr
-        self.q_net = CnnQnet(state_shape, num_actions).to(self.device)
-        self.target_q_net = CnnQnet(state_shape, num_actions).to(self.device)
+        self.q_net = CRnnQnet(state_shape, num_actions).to(self.device)
+        self.target_q_net = CRnnQnet(state_shape, num_actions).to(self.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
         self.replay_buffer = replay_buffer
@@ -291,9 +441,12 @@ class DRQNAgent:
         return actions.cpu().numpy(), new_hidden_state
     
     def train(self):
-        batch = self.replay_buffer.sample(self.batch_size)
-        if batch is None:
+        # 1. 采样现在返回 (batch, indices, is_weights)
+        sample_data = self.replay_buffer.sample(self.batch_size)
+        if sample_data is None:
             return None
+        
+        batch, indices, is_weights_tensor = sample_data
         
         states = batch['states']
         actions = batch['actions']
@@ -301,10 +454,9 @@ class DRQNAgent:
         next_states = batch['next_states']
         dones = batch['dones']
 
-        # [优化] 明确启用 autocast
-        
-        with torch.cuda.amp.autocast(enabled=self.use_scaler):   #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
-        #with torch.amp.autocast('cuda', enabled=self.use_scaler):
+        # 明确启用 autocast
+        # with torch.cuda.amp.autocast(enabled=self.use_scaler):   #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
+        with torch.amp.autocast('cuda', enabled=self.use_scaler):
             q_values, _ = self.q_net(states)
             q_values = q_values.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
 
@@ -315,7 +467,38 @@ class DRQNAgent:
                 target_next_q_values = torch.gather(next_q_values_target_net, 2, next_actions.unsqueeze(-1)).squeeze(-1)
                 target_q_values = rewards + self.gamma * target_next_q_values * (1 - dones)
             
-            loss = nn.MSELoss()(q_values, target_q_values)
+            # 2. 计算逐元素的损失 (reduction='none')
+            loss_fn = nn.MSELoss(reduction='none')
+            elementwise_loss = loss_fn(q_values, target_q_values)
+            
+            # 3. 应用重要性采样 (IS) 权重
+            #    is_weights_tensor 形状为 (B,)
+            #    elementwise_loss 形状为 (B * N_Agents, T_Seq)
+            
+            #    将 is_weights 扩展以匹配 (B, N_Agents, T_Seq) -> (B * N_Agents, T_Seq)
+            is_weights_expanded = is_weights_tensor.repeat_interleave(self.num_agents).unsqueeze(1)
+            is_weights_expanded = is_weights_expanded.expand_as(elementwise_loss)
+
+            #    应用权重并计算平均损失
+            loss = (elementwise_loss * is_weights_expanded).mean()
+
+        # 4. 在反向传播 *之前*，计算 TD-Errors 以更新优先级
+        with torch.no_grad():
+            # (B * N_Agents, T_Seq)
+            td_errors = (q_values - target_q_values).abs()
+            
+            # 我们需要每个采样的 *回合* (B 个) 的优先级，
+            # 而不是每个转换 (B * N_Agents * T_Seq 个)
+            
+            # 1. 变回 (B, N_Agents, T_Seq)
+            td_errors_reshaped = td_errors.view(self.batch_size, self.num_agents, -1)
+            
+            # 2. 计算每个回合的平均 TD-Error (在 N_Agents 和 T_Seq 维度上取平均)
+            episode_priorities = td_errors_reshaped.mean(dim=(1, 2)).cpu().numpy()
+
+        # 5. 更新缓冲区中的优先级
+        self.replay_buffer.update_priorities(indices, episode_priorities)
+
 
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
@@ -325,9 +508,150 @@ class DRQNAgent:
         if self.step_count % self.update_target_steps == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # Epsilon 衰减现在由 meta-agent 控制，
 
         self.step_count += 1
         return loss.item()
+
+# 定义 DQN 网络
+class CnnQnet(CRnnQnet):
+    def __init__(self, input_shape, num_actions):
+        super(CnnQnet, self).__init__(input_shape, num_actions)
+
+        self.fc_layers = nn.Sequential(
+            nn.Linear(self.cnn_output_features, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_actions)
+        )
+
+    def forward(self, x):
+        T = 1
+        if x.dim() == 5: # (B, T, C, H, W)
+            B, T, C, H, W = x.shape
+        else: # (B, C, H, W)
+            B, C, H, W = x.shape
+            x = x.unsqueeze(1)
+
+        cnn_in = x.view(B * T, C, H, W)
+        cnn_out = self.cnn(cnn_in)
+        
+        fc_in = cnn_out.view(B*T, -1)
+        fc_out = self.fc_layers(fc_in)
+        qvalues = fc_out.view(B, T, -1)
+
+        if T == 1:
+            qvalues = qvalues.squeeze(1)
+        return qvalues
     
+# 定义 DQN 智能体
+class DQNAgent(DRQNAgent):
+    def __init__(self, num_agents, state_shape, num_actions, replay_buffer, lr):
+        super(DRQNAgent,self).__init__()
+        # --- 重新初始化 DRQNAgent 的所有属性 ---
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_scaler = torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
+        self.num_agents = num_agents
+        self.state_shape = state_shape
+        self.num_actions = num_actions
+        self.lr = lr
+        
+        # 使用 CnnQnet 而不是 CRnnQnet
+        self.q_net = CnnQnet(state_shape, num_actions).to(self.device)
+        self.target_q_net = CnnQnet(state_shape, num_actions).to(self.device)
+        self.target_q_net.load_state_dict(self.q_net.state_dict())
+        
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
+        self.replay_buffer = replay_buffer
+        self.gamma = 0.99
+        self.batch_size = 32
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.999999955 # 与 DRQN/Reptile 保持一致
+        self.epsilon_min = 0.1
+        self.update_target_steps = 100
+        self.step_count = 0
+
+    def select_actions(self, states):
+        self.q_net.eval()
+        with torch.no_grad():
+            q_values = self.q_net(states)
+        self.q_net.train()
+
+        greedy_actions = q_values.argmax(dim=-1)
+        random_actions = torch.randint(0, self.num_actions, (states.shape[0],), device=self.device)
+        is_random = torch.rand(states.shape[0], device=self.device) < self.epsilon
+        actions = torch.where(is_random, random_actions, greedy_actions)
+        return actions.cpu().numpy()
+    
+    def train(self):
+        # 1. 采样现在返回 (batch, indices, is_weights)
+        sample_data = self.replay_buffer.sample(self.batch_size)
+        if sample_data is None:
+            return None
+        
+        batch, indices, is_weights_tensor = sample_data
+        
+        states = batch['states']
+        actions = batch['actions']
+        rewards = batch['rewards']
+        next_states = batch['next_states']
+        dones = batch['dones']
+
+        # 明确启用 autocast
+        with torch.cuda.amp.autocast(enabled=self.use_scaler):   #由于cuda版本问题，cuda版本较新时，请注释此行，恢复下行
+        #with torch.amp.autocast('cuda', enabled=self.use_scaler):
+            q_values = self.q_net(states)
+            q_values = q_values.gather(-1, actions).squeeze(-1)
+
+            with torch.no_grad():
+                q_values_main_net = self.q_net(next_states)
+                next_actions = q_values_main_net.argmax(dim=-1)
+                next_q_values_target_net = self.target_q_net(next_states)
+                target_next_q_values = torch.gather(next_q_values_target_net, 1, next_actions.unsqueeze(-1)).squeeze(-1)
+                target_q_values = rewards + self.gamma * target_next_q_values * (1 - dones)
+            
+            # 2. 计算逐元素的损失 (reduction='none')
+            loss_fn = nn.MSELoss(reduction='none')
+            elementwise_loss = loss_fn(q_values, target_q_values)
+            
+            # 3. 应用重要性采样 (IS) 权重
+            #    is_weights_tensor 形状为 (B,)
+            #    elementwise_loss 形状为 (B * N_Agents, T_Seq)
+            
+            #    将 is_weights 扩展以匹配 (B, N_Agents, T_Seq) -> (B * N_Agents, T_Seq)
+            is_weights_expanded = is_weights_tensor.repeat_interleave(self.num_agents).unsqueeze(1)
+            is_weights_expanded = is_weights_expanded.expand_as(elementwise_loss)
+
+            #    应用权重并计算平均损失
+            loss = (elementwise_loss * is_weights_expanded).mean()
+
+        # 4. 在反向传播 *之前*，计算 TD-Errors 以更新优先级
+        with torch.no_grad():
+            # (B * N_Agents, T_Seq)
+            td_errors = (q_values - target_q_values).abs()
+            
+            # 我们需要每个采样的 *回合* (B 个) 的优先级，
+            # 而不是每个转换 (B * N_Agents * T_Seq 个)
+            
+            # 1. 变回 (B, N_Agents, T_Seq)
+            td_errors_reshaped = td_errors.view(self.batch_size, self.num_agents, -1)
+            
+            # 2. 计算每个回合的平均 TD-Error (在 N_Agents 和 T_Seq 维度上取平均)
+            episode_priorities = td_errors_reshaped.mean(dim=(1, 2)).cpu().numpy()
+
+        # 5. 更新缓冲区中的优先级
+        self.replay_buffer.update_priorities(indices, episode_priorities)
+
+
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        if self.step_count % self.update_target_steps == 0:
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+
+        # Epsilon 衰减现在由 meta-agent 控制，
+
+        self.step_count += 1
+        return loss.item()

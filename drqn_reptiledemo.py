@@ -1,16 +1,10 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import copy
-import random
-import pogema
-from collections import deque
 import time
 import os
 import task_environment
-from module_set import RewardSet, CnnQnet, ReplayBuffer, DRQNAgent
+from module_set import RewardSet, PrioritizedReplayBuffer, DRQNAgent
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -37,7 +31,7 @@ class Reptile:
         self.batch_size = 128        # 批次大小
 
         # 1. 创建一个“模板”回放池。这实际上不会被 meta_agent 使用。
-        template_buffer = ReplayBuffer(self.replay_buffer_capacity, self.seq_len, num_agents, state_shape, device)
+        template_buffer = PrioritizedReplayBuffer(self.replay_buffer_capacity, self.seq_len, num_agents, state_shape, device)
         
         # 2. 创建元智能体 (meta-agent)
         # 它持有“元权重” (phi)
@@ -120,7 +114,7 @@ class Reptile:
                 task_agent.target_q_net.to(device)
                 task_agent.q_net.lstm.flatten_parameters()
                 task_agent.target_q_net.lstm.flatten_parameters()
-                task_agent.replay_buffer = ReplayBuffer(self.replay_buffer_capacity, self.seq_len, self.num_agents, self.state_shape, device)
+                task_agent.replay_buffer = PrioritizedReplayBuffer(self.replay_buffer_capacity, self.seq_len, self.num_agents, self.state_shape, device)
                 # 修正：确保 task_agent 使用 meta_agent 当前的 epsilon 开始
                 task_agent.epsilon = self.meta_agent.epsilon
 
@@ -166,6 +160,26 @@ class Reptile:
                         ep_dones.append(terminated)
 
                         obs = next_obs
+
+                    episode_length = len(ep_states)
+
+                    if episode_length < self.seq_len:
+                        # 计算需要填充多少步
+                        padding_needed = self.seq_len - episode_length
+                
+                        # 填充所有列表
+                        ep_states.extend([empty_obs_np] * padding_needed)
+                        ep_actions.extend([empty_action_np] * padding_needed)
+                        ep_rewards.extend([empty_reward_list] * padding_needed)
+                        ep_next_states.extend([empty_obs_np] * padding_needed) # 下一个状态也是空的
+                        ep_dones.extend([empty_done_list] * padding_needed) # 标记为 "Done"
+            
+                    # 现在，所有回合（无论长短）都至少是 seq_len 长
+                    # 如果回合长于 seq_len，回放池的采样会自动处理
+                    task_agent.replay_buffer.push({
+                    'states': ep_states, 'actions': ep_actions, 'rewards': ep_rewards,
+                    'next_states': ep_next_states, 'dones': ep_dones
+                     })
                         
                     current_task_episodes += 1
                     current_task_rewards.append(reward_calculator.total_rewards())

@@ -35,7 +35,7 @@ def create_task_env():
         height = random.randint(8, 20)
         seed = random.randint(0, 1_000_000)
         num_targets = random.randint(1, 5)
-        max_episode_steps = 400 # (迷宫通常更难，步数可以少点)
+        max_episode_steps = 400 
         
         map_str = MazeGenerator.generate_maze(
             width=width,
@@ -52,7 +52,7 @@ def create_task_env():
         height = random.randint(10, 30)
         seed = random.randint(0, 1_000_000)
         num_targets = random.randint(1, 5)
-        max_episode_steps = 900 # (随机地图通常更大)
+        max_episode_steps = 900 
         
         # generate_random_map 需要一个设置字典
         random_settings = {
@@ -77,7 +77,7 @@ def create_task_env():
             obstacle_ratio=random.randint(4, 8),
             remove_edge_ratio=random.randint(4, 10),
             seed=seed
-            # 错误修复：移除了 max_episode_steps
+           
         )
 
     elif map_type == 'warehouse':
@@ -85,7 +85,7 @@ def create_task_env():
         # 仓库地图是确定性的，但智能体放置需要种子
         seed = random.randint(0, 1_000_000) 
         num_targets = random.randint(1, 5)
-        max_episode_steps = 1914 # (仓库地图可能非常大)
+        max_episode_steps = 1914 
 
         wh_config = WarehouseConfig(
             wall_width=random.randint(3, 8),
@@ -103,8 +103,8 @@ def create_task_env():
         num_agents=1,
         obs_radius=5,
         on_target='restart',
-        use_maps=False,            # 关键：告诉 create_env_base 不要查找 map_name
-        seed=seed,                 # 关键：用于 agent 和 target 的随机放置
+        use_maps=False,            # create_env_base 不要查找 map_name
+        seed=seed,                 # 用于 agent 和 target 的随机放置
         num_targets=num_targets,   # 传入 num_targets
         max_episode_steps=max_episode_steps # 在这里传入max_episode_steps
     )

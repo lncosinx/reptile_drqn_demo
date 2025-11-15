@@ -8,23 +8,19 @@ import time
 import os
 import torch.multiprocessing as mp
 import task_environment
-from module_set import RewardSet, CnnQnet, ReplayBuffer, DRQNAgent
-
-
-# 检查观察中是否存在目标的奖励函数
+from module_set import RewardSet, CnnQnet, PrioritizedReplayBuffer, DQNAgent
 
 
 # -------------------------------------------------------------------
 # [优化] 工作函数 (Worker Function)
 # -------------------------------------------------------------------
 
-def reptile_worker(args):
+def reptile_dqn_worker(args):
     """
     在单独的进程中执行完整的内部循环（创建环境 + 收集数据 + 训练）。
     
     Args:
         args (tuple): 包含:
-            task_config (dict): 不同地图的配置字典
             meta_q_net (CnnQnet): [共享内存] 元智能体q_net的引用 (这现在是 shared_q_net)
             meta_epsilon (float): 当前的元 epsilon
             worker_config (dict): 包含所有超参数的字典
@@ -43,14 +39,17 @@ def reptile_worker(args):
         state_shape = worker_config['state_shape']
 
         # 3. 重新创建 task_agent
-        task_buffer = ReplayBuffer(
+        task_buffer = PrioritizedReplayBuffer(
             worker_config['replay_buffer_capacity'],
             seq_len,
             num_agents,
             state_shape,
-            worker_device
+            worker_device,
+            alpha=worker_config['per_alpha'],
+            beta_start=worker_config['per_beta_start'],
+            beta_frames=worker_config['inner_steps']
         )
-        task_agent = DRQNAgent(
+        task_agent = DQNAgent(
             num_agents,
             state_shape,
             worker_config['num_actions'],
@@ -66,8 +65,6 @@ def reptile_worker(args):
         
         task_agent.q_net.to(worker_device)
         task_agent.target_q_net.to(worker_device)
-        task_agent.q_net.lstm.flatten_parameters()
-        task_agent.target_q_net.lstm.flatten_parameters()
 
         # 5. 设置当前的 epsilon
         task_agent.epsilon = meta_epsilon
@@ -78,7 +75,7 @@ def reptile_worker(args):
         current_task_episodes = 0
         current_task_rewards = []
 
-        # 为填充（padding）准备“空”数据
+        # 为填充（padding）准备“空”数据，以确保所有回合至少为 seq_len 长
         # (N, C, H, W)
         empty_obs_np = np.zeros((num_agents, *state_shape), dtype=np.float32) 
          # (N,)
@@ -88,20 +85,18 @@ def reptile_worker(args):
         # (N,)
         empty_done_list = [True] * num_agents
         
-        while current_task_episodes < worker_config['episodes_per_task']:
+        while current_task_episodes < worker_config['episodes_per_task']: # 收集 episodes_per_task 回合
             ep_states, ep_actions, ep_rewards, ep_next_states, ep_dones = [], [], [], [], []
             obs, info = task_env.reset()
-            current_hidden_state = None
             terminated = [False] * num_agents
             truncated = [False] * num_agents
             reward_calculator = RewardSet(num_agents, worker_device)
             
-            while not (all(terminated) or all(truncated)): # 修改终止条件以确保达到目标数量
+            while not (all(terminated) or all(truncated)): # 单个回合
                 obs_np = np.array(obs)
                 states_tensor = torch.tensor(obs_np, dtype=torch.float32, device=worker_device)
                 
-                actions, new_hidden_state = task_agent.select_actions(states_tensor, current_hidden_state)
-                current_hidden_state = new_hidden_state
+                actions = task_agent.select_actions(states_tensor)
                 
                 next_obs, rewards, terminated, truncated, info = task_env.step(actions)
                 next_obs_np = np.array(next_obs)
@@ -199,18 +194,20 @@ class Reptile:
         # --- 内循环超参数 ---
         self.inner_lr = 0.0001
         self.inner_steps = 512     # [建议] 大幅增加内部训练步数 (原为 32)
-        self.episodes_per_task = 300 #增大episodes_per_tas，保证数据的多样性
+        self.episodes_per_task = 300 # 增大 episodes_per_tas ，保证数据的多样性
         
         # --- 回放池参数 ---
         # [建议] 容量应与收集的回合数匹配
+        self.per_alpha = 0.6
+        self.per_beta_start = 0.4
         self.replay_buffer_capacity = self.episodes_per_task
-        self.seq_len = 24
+        self.seq_len = 1 # DQN 采样的序列长度为1
         self.batch_size = 128  #减小batch size，解决批次间的高度相关性，提高采样效率（原为256）
 
-        template_buffer = ReplayBuffer(1, 1, num_agents, state_shape, self.device)
+        template_buffer = PrioritizedReplayBuffer(1, 1, num_agents, state_shape, self.device)
         
         # meta_agent 的 q_net 和 target_q_net 始终保留在主 device (GPU) 上
-        self.meta_agent = DRQNAgent(num_agents, state_shape, num_actions, template_buffer, lr=self.inner_lr)
+        self.meta_agent = DQNAgent(num_agents, state_shape, num_actions, template_buffer, lr=self.inner_lr)
         self.meta_agent.batch_size = self.batch_size
         # self.meta_agent 的所有组件 (q_net, target_q_net, optimizer) 都在 self.device (GPU) 上
 
@@ -220,21 +217,16 @@ class Reptile:
         if model_path and os.path.exists(model_path):
             print(f"正在从 '{model_path}' 加载检查点...")
             try:
-                # [修改] 将检查点加载到主 device (GPU)
+                # 将检查点加载到主 device (GPU)
                 checkpoint = torch.load(model_path, map_location=self.device)
                 
-                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    self.meta_agent.q_net.load_state_dict(checkpoint['model_state_dict'])
-                    self.meta_agent.target_q_net.load_state_dict(checkpoint['model_state_dict']) # [新增] 确保 target 也加载
-                    self.meta_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    self.meta_agent.epsilon = checkpoint['epsilon']
-                    self.loaded_meta_agent_total_steps = checkpoint.get('meta_agent_total_steps', 0)
-                    self.start_meta_iter = checkpoint.get('current_meta_iter', 0) + 1
-                    print(f"成功加载检查点。将从 Iter {self.start_meta_iter} 和 Epsilon {self.meta_agent.epsilon:.4f} 处恢复。")
-                else:
-                    self.meta_agent.q_net.load_state_dict(checkpoint)
-                    self.meta_agent.target_q_net.load_state_dict(checkpoint) # [新增] 确保 target 也加载
-                    print(f"警告：成功加载旧格式模型权重。Epsilon 和优化器将重置。")
+                self.meta_agent.q_net.load_state_dict(checkpoint['model_state_dict'])
+                self.meta_agent.target_q_net.load_state_dict(checkpoint['model_state_dict']) 
+                self.meta_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.meta_agent.epsilon = checkpoint['epsilon']
+                self.loaded_meta_agent_total_steps = checkpoint.get('meta_agent_total_steps', 0)
+                self.start_meta_iter = checkpoint.get('current_meta_iter', 0) + 1
+                print(f"成功加载检查点。将从 Iter {self.start_meta_iter} 和 Epsilon {self.meta_agent.epsilon:.4f} 处恢复。")
 
             except Exception as e:
                 print(f"加载模型 '{model_path}' 失败: {e}。将从头开始训练。")
@@ -250,8 +242,8 @@ class Reptile:
         self.print_freq = 100 # 按任务数打印
         self.save_freq = 1000 # 按任务数保存
         
-        self.model_save_path_interrupt = 'reptile_drqn_meta_agent_interrupt.pth'
-        self.model_save_path_final = 'reptile_drqn.pth'
+        self.model_save_path_interrupt = 'reptile_dqn_meta_agent_interrupt.pth'
+        self.model_save_path_final = 'reptile_dqn.pth'
         
         self.worker_config = {
             'replay_buffer_capacity': self.replay_buffer_capacity,
@@ -267,6 +259,8 @@ class Reptile:
             'epsilon_decay': self.meta_agent.epsilon_decay,
             'gamma': self.meta_agent.gamma,
             'update_target_steps': self.meta_agent.update_target_steps,
+            'per_alpha': self.per_alpha,
+            'per_beta_start': self.per_beta_start,
         }
         
         print(f"正在创建 {self.parallel_batch_size} 个工作进程的进程池...")
@@ -306,13 +300,15 @@ class Reptile:
         tasks_processed_count = self.start_meta_iter
         all_losses = []
         all_rewards = []
+        all_seeds = []
+        all_map_types = []
         
         # 收集一个批次的增量
         delta_batch = []
         
         try:
             # 创建异步任务迭代器
-            task_iterator = self.pool.imap_unordered(reptile_worker, self._task_generator())
+            task_iterator = self.pool.imap_unordered(reptile_dqn_worker, self._task_generator())
             
             # 持续从迭代器中获取结果，直到达到总任务数
             while tasks_processed_count < self.total_meta_iterations:
@@ -328,6 +324,8 @@ class Reptile:
                     delta_batch.append(delta)
                     all_losses.append(avg_loss)
                     all_rewards.append(avg_reward)
+                    all_map_types.append(map_type)
+                    all_seeds.append(seed)
                     
                     # 3. 衰减 Epsilon
                     meta_agent_total_steps += steps_trained
@@ -345,7 +343,7 @@ class Reptile:
                     
                     for delta_cpu in delta_batch:
                         for name, delta_tensor_cpu in delta_cpu.items():
-                            # [修改] 确保在正确的 device 上累加
+                            # 确保在正确的 device 上累加
                             if name in avg_delta_gpu:
                                 avg_delta_gpu[name] += delta_tensor_cpu.to(self.device)
                     
@@ -356,7 +354,7 @@ class Reptile:
                             if name in avg_delta_gpu:
                                 param.data += self.meta_lr * (avg_delta_gpu[name] / num_successful_workers)
 
-                    # 同步：将更新后的 GPU 权重复制到
+                    # 同步：将更新后的 GPU 权重复制到 CPU
                     # 1. GPU 上的 target network
                     self.meta_agent.target_q_net.load_state_dict(self.meta_agent.q_net.state_dict())
                     # 2. CPU 上的 shared network
@@ -436,12 +434,12 @@ if __name__ == '__main__':
     # 核心数 (根据 CPU 调整)
     CPU_COUNT = os.cpu_count()
     #PARALLEL_BATCH_SIZE = int(CPU_COUNT * 0.9) if CPU_COUNT else 14 # 使用 80% 的核心
-    PARALLEL_BATCH_SIZE = 16 # 使用14个核心
+    PARALLEL_BATCH_SIZE = 16 # 使用16个核心
     if PARALLEL_BATCH_SIZE == 0: PARALLEL_BATCH_SIZE = 1
     
     print(f"检测到 {CPU_COUNT} 个 CPU 核心, 将使用 {PARALLEL_BATCH_SIZE} 个并行工作进程。")
     
-    TOTAL_META_ITERATIONS = 100000 # 总任务数 (epsilon_decay的设置方式：epsilon_decay**TOTAL_META_ITERATIONS = 0.1)
+    TOTAL_META_ITERATIONS = 100000 # 总任务数 (epsilon_decay的设置方式：epsilon_decay**TOTAL_META_ITERATIONS = 0.1) 
 
     model_path = 'reptile_drqn_meta_agent_interrupt.pth' if os.path.exists('reptile_drqn_meta_agent_interrupt.pth') else None
 
